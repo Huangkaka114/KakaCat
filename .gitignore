@@ -32,6 +32,8 @@ htmlcov/
 _hls_tmp*/
 
 # ---- 编辑器与操作系统 ----
+# JetBrains / PyCharm 的本机配置，因人而异，不入库
+.idea/
 .vscode/
 .DS_Store
 Thumbs.db
