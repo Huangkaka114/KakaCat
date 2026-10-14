@@ -87,7 +87,7 @@ class SectionTitle(ctk.CTkFrame):
         kwargs.setdefault("fg_color", "transparent")
         super().__init__(master, **kwargs)
         bar = ctk.CTkFrame(
-            self, width=3, height=16, corner_radius=2, fg_color=theme.PRIMARY
+            self, width=3, height=16, corner_radius=2, fg_color=theme.ACCENT
         )
         bar.grid(row=0, column=0, sticky="ns", padx=(0, theme.SPACE_SM))
         bar.grid_propagate(False)
@@ -224,7 +224,7 @@ class StatusPanel(Card):
             height=10,
             corner_radius=5,
             fg_color=theme.PROGRESS_TRACK,
-            progress_color=theme.PRIMARY,
+            progress_color=theme.ACCENT,
         )
         self._progress_bar.set(0.0)
         self._progress_bar.grid(
@@ -273,7 +273,7 @@ class StatusPanel(Card):
             TaskStage.FAILED: theme.ERROR,
             TaskStage.CANCELLED: theme.WARNING,
             TaskStage.CANCELLING: theme.WARNING,
-        }.get(report.stage, theme.PRIMARY)
+        }.get(report.stage, theme.ACCENT)
 
         segments = (
             f"{report.completed_segments} / {report.total_segments}"
@@ -405,22 +405,36 @@ class LogPanel(Card):
         self.textbox.configure(state="disabled")
 
     def append(self, message: str, level: str = "info") -> None:
-        """追加一条日志。``level`` 取 ``info``/``success``/``warn``/``error``。"""
+        """追加一条日志。``level`` 取 ``info``/``success``/``warn``/``error``。
+
+        消息本身可能含换行（错误提示常是多行），所以裁剪必须按**实际写入的
+        物理行数**进行，而不是按消息条数——否则行数上限会被突破数倍。
+        """
         if level not in ("info", "success", "warn", "error"):
             level = "info"
 
         self.textbox.configure(state="normal")
         self.textbox.insert("end", f"[{time.strftime('%H:%M:%S')}] ", "ts")
         self.textbox.insert("end", message.rstrip() + "\n", level)
-
-        self._line_count += 1
-        if self._line_count > MAX_LOG_LINES:
-            excess = self._line_count - MAX_LOG_LINES
-            self.textbox.delete("1.0", f"{excess + 1}.0")
-            self._line_count -= excess
+        self._trim_to_limit()
 
         self._scroll_to_end()
         self.textbox.configure(state="disabled")
+
+    def _trim_to_limit(self) -> None:
+        """按文本框的实际行数裁剪到上限。"""
+        self._line_count = self._count_lines()
+        if self._line_count > MAX_LOG_LINES:
+            excess = self._line_count - MAX_LOG_LINES
+            self.textbox.delete("1.0", f"{excess + 1}.0")
+            self._line_count = self._count_lines()
+
+    def _count_lines(self) -> int:
+        """行数交给 Tk 自己数（``end-1c`` 的行号就是物理行数），避免手数出错。"""
+        try:
+            return int(str(self.textbox.index("end-1c")).split(".")[0])
+        except Exception:  # pragma: no cover - 控件可能已销毁
+            return self._line_count
 
     def clear(self) -> None:
         self.textbox.configure(state="normal")

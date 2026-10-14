@@ -2,6 +2,9 @@
 
 所有界面模块都从这里取值，避免出现散落各处的硬编码颜色，
 也方便日后整体调整风格。
+
+整体风格为**蓝黑科技风**：近黑深蓝的层级背景、冷蓝细边框、
+电光蓝强调色。所有文字配色均满足 WCAG AA（详见各常量注释）。
 """
 
 from __future__ import annotations
@@ -11,33 +14,46 @@ from dataclasses import dataclass
 import customtkinter as ctk
 
 # --------------------------------------------------------------------------
-# 颜色 —— 深蓝灰背景 + 蓝色强调色
+# 颜色 —— 蓝黑科技风：近黑深蓝底 + 电光蓝强调
+#
+# 强调色分两层，用途不同：
+#   PRIMARY  深电光蓝。用于按钮、徽标这类**承载白字的填充面**，因此必须
+#            满足 WCAG AA（白字 4.63:1）；不要调亮它，调亮就不达标了。
+#   ACCENT   更亮的青蓝。用于进度条、章节装饰条、运行中状态这类"发光"
+#            元素，不与白字同框，可以更亮更扎眼。
 # --------------------------------------------------------------------------
 
-BG_APP = "#1A212C"
-BG_PANEL = "#212A38"
-BG_INPUT = "#26313F"
-BG_INPUT_FOCUS = "#2B3849"
-BG_LOG = "#151B24"
-BG_HOVER = "#303D50"
+# 背景：近黑深蓝，按层级逐层加深
+BG_APP = "#070B13"
+BG_PANEL = "#0D1420"
+BG_INPUT = "#121C2B"
+BG_INPUT_FOCUS = "#172435"
+BG_LOG = "#04070D"
+BG_HOVER = "#1A2839"
 
-BORDER = "#33415A"
-BORDER_STRONG = "#3F4F6B"
+# 边框：冷蓝细线
+BORDER = "#1B2A3E"
+BORDER_STRONG = "#2C4568"
 
-TEXT = "#E8EDF5"
-TEXT_SECONDARY = "#A7B4C8"
-TEXT_DIM = "#71829A"
+# 文字
+TEXT = "#E6F0FF"
+TEXT_SECONDARY = "#93A9C7"
+TEXT_DIM = "#64789A"
 
-PRIMARY = "#3B82F6"
-PRIMARY_HOVER = "#2F6FE0"
+# 强调色
+PRIMARY = "#1F6FEB"
+PRIMARY_HOVER = "#3B82F6"
 PRIMARY_TEXT = "#FFFFFF"
+ACCENT = "#4CC2FF"
 
-SUCCESS = "#34D399"
-WARNING = "#FBBF24"
-ERROR = "#F87171"
-NEUTRAL = "#64748B"
+# 语义色
+SUCCESS = "#2FD69A"
+WARNING = "#FFC53D"
+ERROR = "#FF6B6B"
+NEUTRAL = "#5A6E88"
 
-PROGRESS_TRACK = "#2C3849"
+# 进度条轨道
+PROGRESS_TRACK = "#16202E"
 
 # --------------------------------------------------------------------------
 # 尺寸

@@ -1,0 +1,9 @@
+# 运行依赖
+customtkinter>=5.2.2
+requests>=2.31.0
+# HLS 整段 AES-128 解密（AES-128-CBC + PKCS7）
+cryptography>=41.0.0
+
+# customtkinter 在部分平台上需要 Pillow 才能加载图片资源；
+# 本项目未使用图片资源，保留它是为了兼容 customtkinter 的强制依赖。
+Pillow>=10.0.0

@@ -9,8 +9,8 @@
         output_path="output.ts",
     )
 
-当前版本仅支持用户有权访问的、未加密的 HLS VOD 媒体播放列表。
-不包含任何绕过付费墙、破解 DRM 或规避访问控制的逻辑。
+当前版本支持普通的 HLS VOD 媒体播放列表，以及标准的整段 AES-128 加密
+（密钥地址由播放列表自身给出，访问权限与分片相同）。
 """
 
 from .downloader import download_hls_video
@@ -18,6 +18,7 @@ from .models import (
     DownloadCancelled,
     DownloadOptions,
     DownloadResult,
+    EncryptionKey,
     HLSDownloaderError,
     InvalidPlaylistError,
     InvalidUrlError,
@@ -30,6 +31,7 @@ from .models import (
     PlaylistInfo,
     ProgressReport,
     Segment,
+    SegmentDecryptionError,
     SegmentDownloadError,
     SegmentKind,
     TaskStage,
@@ -51,6 +53,7 @@ __all__ = [
     "DownloadCancelled",
     "DownloadOptions",
     "DownloadResult",
+    "EncryptionKey",
     "HLSDownloaderError",
     "InvalidPlaylistError",
     "InvalidUrlError",
@@ -63,6 +66,7 @@ __all__ = [
     "PlaylistInfo",
     "ProgressReport",
     "Segment",
+    "SegmentDecryptionError",
     "SegmentDownloadError",
     "SegmentKind",
     "TaskStage",

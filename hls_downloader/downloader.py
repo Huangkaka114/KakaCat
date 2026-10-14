@@ -20,17 +20,19 @@ from typing import Callable
 
 import requests
 
-from . import merger
+from . import crypto, merger
 from .models import (
     DownloadCancelled,
     DownloadOptions,
     DownloadResult,
+    EncryptionKey,
     HLSDownloaderError,
     MergeError,
     OutputExistsError,
     PlaylistFetchError,
     PlaylistInfo,
     ProgressReport,
+    SegmentDecryptionError,
     SegmentDownloadError,
     SegmentKind,
     TaskStage,
@@ -55,6 +57,9 @@ MAX_RETRY_DELAY_SECONDS = 8.0
 
 SPEED_WINDOW_SECONDS = 5.0
 PROGRESS_EMIT_INTERVAL_SECONDS = 0.1
+#: 任务真正完成前对外显示的最大进度。分片下完不等于任务完成——合并仍可能
+#: 失败，进度条不该先走满再报错。
+MAX_PERCENT_BEFORE_COMPLETION = 99.0
 
 USER_AGENT = "KakaCat-HLSDownloader/1.0"
 
@@ -152,10 +157,16 @@ def download_hls_video(
 
 @dataclass(frozen=True)
 class _DownloadItem:
-    """一个需要下载到本地的文件（分片或 fMP4 初始化分片）。"""
+    """一个需要下载到本地的文件（分片或 fMP4 初始化分片）。
+
+    ``key`` 不为空时表示该分片使用标准整段 AES-128 加密，``iv`` 是已经按
+    RFC 8216 推导好的 16 字节初始向量。
+    """
 
     url: str
     filename: str
+    key: EncryptionKey | None = None
+    iv: bytes | None = None
 
 
 class _RetryableSegmentError(Exception):
@@ -204,6 +215,17 @@ def _run(
             TaskStage.DOWNLOADING_SEGMENTS, f"开始下载，共 {len(items)} 个分片。"
         )
 
+        if playlist.encryption_method and playlist.encryption_method != "NONE":
+            log.info("播放列表使用 %s 整段加密，将在下载后逐片解密。", playlist.encryption_method)
+            if playlist.init_segment_url:
+                # 初始化分片不参与解密（它的 IV 由 #EXT-X-KEY 的显式 IV 决定，
+                # 而这条流未必给出）。这种情况可能产出无法播放的文件，必须说明，
+                # 不能默默报成功。
+                log.warning(
+                    "该加密播放列表同时包含 fMP4 初始化分片（#EXT-X-MAP）："
+                    "初始化分片不参与解密，若产物无法播放，请改用对应的 TS 版本。"
+                )
+
         temp_path = _create_temp_dir(temp_dir)
         succeeded = False
         try:
@@ -224,6 +246,7 @@ def _run(
                 target=target,
                 segment_kind=playlist.segment_kind,
                 ffmpeg_path=ffmpeg_path,
+                cancel_event=cancel,
                 log=log,
             )
 
@@ -279,6 +302,7 @@ def _download_all(
     """按顺序下载所有分片，返回本地文件路径列表。"""
     local_paths: list[Path] = []
     total = len(items)
+    key_cache = _KeyCache(session=session, cancel=cancel, max_retries=max_retries, log=log)
 
     for position, item in enumerate(items, start=1):
         _check_cancel(cancel)
@@ -294,6 +318,7 @@ def _download_all(
             log=log,
             position=position,
             total=total,
+            key_cache=key_cache,
         )
         local_paths.append(destination)
         progress.finish_item()
@@ -312,9 +337,14 @@ def _download_one(
     log: logging.Logger,
     position: int,
     total: int,
+    key_cache: "_KeyCache",
 ) -> int:
     """下载单个分片，失败时按策略重试；重试耗尽后抛出异常。"""
     last_error: Exception | None = None
+
+    # 密钥放在重试循环之外获取：同一个播放列表通常所有分片共用一个密钥，
+    # 取一次即可（_KeyCache 内部还有按 URI 的缓存）。
+    segment_key = key_cache.get(item.key.uri) if item.key is not None else None
 
     for attempt in range(max_retries + 1):
         _check_cancel(cancel)
@@ -334,7 +364,14 @@ def _download_one(
                 status = response.status_code
                 if status == 200:
                     try:
-                        return _write_stream(response, destination, cancel, progress)
+                        return _write_stream(
+                            response,
+                            destination,
+                            cancel,
+                            progress,
+                            key=segment_key,
+                            iv=item.iv,
+                        )
                     except (requests.RequestException, _RetryableSegmentError) as exc:
                         last_error = exc
                     except OSError as exc:
@@ -373,30 +410,150 @@ def _write_stream(
     destination: Path,
     cancel: threading.Event,
     progress: "_ProgressReporter",
+    *,
+    key: bytes | None = None,
+    iv: bytes | None = None,
 ) -> int:
-    """把响应体流式写入磁盘，避免一次性读入内存。"""
+    """把响应体写入磁盘。
+
+    未加密时直接流式落盘，不把分片读进内存；加密分片则需要先缓冲**这一个
+    分片**的密文，再整体解密——AES-128-CBC 要拿到末尾才能校验并去掉 PKCS7
+    填充。缓冲的是单个分片（通常几百 KB），不是整个视频。
+    """
     expected = _content_length(response)
     progress.begin_item(expected)
 
-    written = 0
+    if key is None:
+        written = 0
+        try:
+            with open(destination, "wb") as handle:
+                for chunk in response.iter_content(DOWNLOAD_CHUNK_SIZE):
+                    _check_cancel(cancel)
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    written += len(chunk)
+                    progress.add_bytes(len(chunk))
+        except DownloadCancelled:
+            _remove_quietly(destination)
+            raise
+
+        if written == 0:
+            _remove_quietly(destination)
+            raise _RetryableSegmentError("服务器返回了空的分片内容")
+
+        return written
+
+    # ---- 加密分片 ----
+    buffer = bytearray()
     try:
-        with open(destination, "wb") as handle:
-            for chunk in response.iter_content(DOWNLOAD_CHUNK_SIZE):
-                _check_cancel(cancel)
-                if not chunk:
-                    continue
-                handle.write(chunk)
-                written += len(chunk)
-                progress.add_bytes(len(chunk))
+        for chunk in response.iter_content(DOWNLOAD_CHUNK_SIZE):
+            _check_cancel(cancel)
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            progress.add_bytes(len(chunk))
     except DownloadCancelled:
         _remove_quietly(destination)
         raise
 
-    if written == 0:
+    if not buffer:
         _remove_quietly(destination)
         raise _RetryableSegmentError("服务器返回了空的分片内容")
 
-    return written
+    if iv is None:
+        _remove_quietly(destination)
+        raise SegmentDecryptionError("加密分片缺少初始向量（IV），无法解密。")
+
+    try:
+        plain = crypto.decrypt_segment(bytes(buffer), key, iv)
+    except SegmentDecryptionError:
+        _remove_quietly(destination)
+        raise
+
+    try:
+        destination.write_bytes(plain)
+    except OSError:
+        _remove_quietly(destination)
+        raise
+
+    return len(plain)
+
+
+class _KeyCache:
+    """按 URI 获取并缓存 AES-128 密钥。
+
+    密钥地址由播放列表自己给出，访问权限与分片一致；这里不猜测、不派生，
+    也不会去任何许可证服务器索取密钥。
+    """
+
+    def __init__(
+        self,
+        *,
+        session: requests.Session,
+        cancel: threading.Event,
+        max_retries: int,
+        log: logging.Logger,
+    ) -> None:
+        self._session = session
+        self._cancel = cancel
+        self._max_retries = max(0, int(max_retries))
+        self._log = log
+        self._keys: dict[str, bytes] = {}
+
+    def get(self, uri: str) -> bytes:
+        """返回 16 字节密钥；同一个 URI 只会真正请求一次。"""
+        cached = self._keys.get(uri)
+        if cached is not None:
+            return cached
+
+        key = self._fetch(uri)
+        self._keys[uri] = key
+        return key
+
+    def _fetch(self, uri: str) -> bytes:
+        last_error: SegmentDecryptionError | None = None
+
+        for attempt in range(self._max_retries + 1):
+            _check_cancel(self._cancel)
+            try:
+                response = self._session.get(
+                    uri, timeout=HTTP_TIMEOUT, allow_redirects=True
+                )
+            except requests.Timeout:
+                last_error = SegmentDecryptionError("获取解密密钥超时。")
+            except requests.RequestException as exc:
+                last_error = SegmentDecryptionError(
+                    f"获取解密密钥失败：{exc.__class__.__name__}"
+                )
+            else:
+                with response:
+                    status = response.status_code
+                    if status == 200:
+                        key = response.content
+                        if len(key) != crypto.AES_BLOCK_SIZE:
+                            raise SegmentDecryptionError(
+                                f"解密密钥长度应为 {crypto.AES_BLOCK_SIZE} 字节，"
+                                f"实际为 {len(key)} 字节。"
+                            )
+                        self._log.info("已获取 AES-128 解密密钥：%s", redact_url(uri))
+                        return key
+                    if 400 <= status < 500 and status != 429:
+                        raise SegmentDecryptionError(
+                            f"获取解密密钥失败：服务器返回 HTTP {status}。"
+                        )
+                    last_error = SegmentDecryptionError(
+                        f"获取解密密钥失败：服务器返回 HTTP {status}。"
+                    )
+
+            if attempt < self._max_retries:
+                delay = min(RETRY_BACKOFF_SECONDS * (2**attempt), MAX_RETRY_DELAY_SECONDS)
+                self._log.warning("获取解密密钥失败（%s），%.1f 秒后重试。", last_error, delay)
+                if self._cancel.wait(delay):
+                    raise DownloadCancelled("任务已取消。")
+
+        assert last_error is not None
+        raise last_error
 
 
 def _merge_into_place(
@@ -405,12 +562,16 @@ def _merge_into_place(
     target: Path,
     segment_kind: SegmentKind,
     ffmpeg_path: str | None,
+    cancel_event: threading.Event | None,
     log: logging.Logger,
 ) -> int:
     """先合并到同目录的 ``.part`` 文件，成功后原子替换到目标路径。
 
     这样即使合并失败，也不会在目标路径留下不完整的视频文件，
     更不会破坏用户原有的同名文件。
+
+    合并期间同样会响应 ``cancel_event``：被取消时清理 ``.part`` 文件，
+    并向上抛出 :class:`~hls_downloader.models.DownloadCancelled`。
     """
     staging = target.with_name(f"{target.name}.part")
     _remove_quietly(staging)
@@ -422,6 +583,7 @@ def _merge_into_place(
             segment_kind,
             container_suffix=target.suffix,
             ffmpeg_path=ffmpeg_path,
+            cancel_event=cancel_event,
             logger=log,
         )
         if not staging.is_file() or staging.stat().st_size == 0:
@@ -491,15 +653,20 @@ def _build_items(playlist: PlaylistInfo) -> list[_DownloadItem]:
     items: list[_DownloadItem] = []
 
     if playlist.init_segment_url and playlist.segment_kind is SegmentKind.FMP4:
+        # 初始化分片按原样下载：它不参与整段 AAC/H.264 解密，IV 也无从推导。
         items.append(_DownloadItem(url=playlist.init_segment_url, filename="000000-init.mp4"))
 
     offset = len(items)
     for segment in playlist.segments:
         suffix = get_extension(segment.url) or ".bin"
+        key = segment.key if (segment.key and segment.key.is_encrypted) else None
+        iv = crypto.build_iv(key, playlist.media_sequence, segment.index) if key else None
         items.append(
             _DownloadItem(
                 url=segment.url,
                 filename=f"{segment.index + offset:06d}{suffix}",
+                key=key,
+                iv=iv,
             )
         )
 
@@ -534,11 +701,20 @@ def _prepare_output(output_path: str | os.PathLike[str], *, overwrite: bool) -> 
 
 
 def _create_temp_dir(temp_dir: str | os.PathLike[str] | None) -> Path:
+    """在指定父目录（默认系统临时目录）下创建一个唯一的临时分片目录。"""
+    parent: Path | None = None
+    if temp_dir:
+        parent = Path(temp_dir).expanduser()
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HLSDownloaderError(f"无法创建临时目录 {parent}：{exc}") from exc
+
     try:
         return Path(
             tempfile.mkdtemp(
                 prefix="hls_segments_",
-                dir=str(temp_dir) if temp_dir else None,
+                dir=str(parent) if parent else None,
             )
         )
     except OSError as exc:
@@ -609,6 +785,7 @@ class _ProgressReporter:
         self._item_expected: int | None = None
         self._download_started: float | None = None
         self._last_emit = 0.0
+        self._max_percent = 0.0
 
     def set_total(self, total: int) -> None:
         self._total = max(0, total)
@@ -656,13 +833,24 @@ class _ProgressReporter:
             return
         self._last_emit = now
 
+        percent = self._percent()
+        # 完成前封顶在 99%：分片下完不代表任务完成，合并仍可能失败。
+        if self._stage is not TaskStage.COMPLETED and percent > MAX_PERCENT_BEFORE_COMPLETION:
+            percent = MAX_PERCENT_BEFORE_COMPLETION
+        # 分片重试会丢弃上一次尝试写入的数据，_percent() 因而可能回落；
+        # 对外呈现的进度必须单调不减，否则界面上的进度条会往回跳。
+        if percent > self._max_percent:
+            self._max_percent = percent
+        else:
+            percent = self._max_percent
+
         try:
             self._callback(
                 ProgressReport(
                     stage=self._stage,
                     completed_segments=self._completed,
                     total_segments=self._total,
-                    percent=self._percent(),
+                    percent=percent,
                     speed_bps=self._speed(),
                     eta_seconds=self._eta(),
                     message=self._message,

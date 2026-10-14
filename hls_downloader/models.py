@@ -128,9 +128,31 @@ class DownloadCancelled(HLSDownloaderError):
     """用户主动取消任务。"""
 
 
+class SegmentDecryptionError(HLSDownloaderError):
+    """分片解密失败：密钥/IV 不正确，或密文本身不完整。"""
+
+
 # --------------------------------------------------------------------------
 # 数据结构
 # --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EncryptionKey:
+    """一个整段加密密钥（RFC 8216 的 ``#EXT-X-KEY``）。
+
+    当前只支持标准的 ``AES-128`` 整段加密；``key_format`` 只作记录，
+    不参与任何判断。
+    """
+
+    method: str
+    uri: str
+    iv: str | None = None
+    key_format: str | None = None
+
+    @property
+    def is_encrypted(self) -> bool:
+        return self.method.strip().upper() not in ("", "NONE")
 
 
 @dataclass(frozen=True)
@@ -141,6 +163,7 @@ class Segment:
     url: str
     duration: float | None = None
     title: str | None = None
+    key: "EncryptionKey | None" = None
 
 
 @dataclass(frozen=True)

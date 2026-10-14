@@ -1,10 +1,11 @@
 """M3U8 播放列表解析。
 
-当前版本只支持普通、未加密的 HLS VOD 媒体播放列表：
+当前版本只支持普通的 HLS VOD 媒体播放列表：
 
 * 必须是媒体播放列表（media playlist），传入主播放列表会明确报错；
 * 必须包含 ``#EXT-X-ENDLIST``（直播或未完成的列表会被拒绝）；
-* 必须未加密（``METHOD=NONE`` 视为未加密，其他加密方式一律拒绝）；
+* 支持标准的整段 ``AES-128`` 加密（``METHOD=NONE`` 视为未加密）；
+  其他加密方式当前版本没有实现，会明确报错；
 * 支持 TS 与 fMP4/CMAF 分片，按字节范围（``#EXT-X-BYTERANGE``）切分的
   播放列表当前版本不支持。
 """
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 from .models import (
+    EncryptionKey,
     InvalidPlaylistError,
     LivePlaylistError,
     MasterPlaylistError,
@@ -38,6 +40,23 @@ _AUDIO_ONLY_SUFFIXES = frozenset({".aac", ".mp3", ".ac3", ".eac3", ".m4a", ".fla
 
 #: 视为未加密的 METHOD 取值
 _UNENCRYPTED_METHODS = frozenset({"", "NONE"})
+
+#: 本程序实现（且仅实现）的整段加密方式
+_SUPPORTED_ENCRYPTION_METHODS = frozenset({"AES-128"})
+
+#: 明确不是视频分片的扩展名：字幕、缩略图、密钥文件、网页等。
+#: 这些内容按二进制拼出来的"视频"根本不能播，必须明确拒绝，
+#: 而不是归入"未知格式"照常下载后报告成功（那就是伪装成功）。
+_NON_MEDIA_SUFFIXES = frozenset(
+    {
+        # 字幕
+        ".vtt", ".webvtt", ".srt", ".ttml", ".dfxp", ".ass", ".ssa",
+        # 缩略图
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp",
+        # 密钥与其它
+        ".key", ".html", ".htm", ".json", ".xml",
+    }
+)
 
 
 def parse_playlist(text: str, base_url: str) -> PlaylistInfo:
@@ -77,6 +96,7 @@ def parse_playlist(text: str, base_url: str) -> PlaylistInfo:
     target_duration: int | None = None
     media_sequence = 0
     encryption_method: str | None = None
+    current_key: EncryptionKey | None = None
     init_segment_url: str | None = None
 
     for line in lines[1:]:
@@ -91,6 +111,7 @@ def parse_playlist(text: str, base_url: str) -> PlaylistInfo:
                     url=url,
                     duration=pending_duration,
                     title=pending_title,
+                    key=current_key,
                 )
             )
             pending_duration = None
@@ -126,14 +147,10 @@ def parse_playlist(text: str, base_url: str) -> PlaylistInfo:
         elif tag == "#EXT-X-MEDIA-SEQUENCE":
             media_sequence = _safe_int(value) or 0
         elif tag == "#EXT-X-KEY":
-            method = _parse_attributes(value).get("METHOD", "")
-            method = (method or "").upper()
-            if method not in _UNENCRYPTED_METHODS:
-                raise UnsupportedEncryptionError(
-                    f"播放列表使用加密方式 {method} 保护分片，当前版本只支持未加密的播放列表。\n"
-                    "本程序不会尝试获取密钥或绕过加密。"
-                )
-            encryption_method = "NONE"
+            # 按 RFC 8216，密钥作用于它之后的**所有**分片，直到出现下一个
+            # #EXT-X-KEY。因此这里保存“当前生效的密钥”，逐个分片关联。
+            current_key = _parse_key(value, base_url)
+            encryption_method = current_key.method if current_key is not None else "NONE"
         elif tag == "#EXT-X-MAP":
             init_segment_url = _resolve_map_uri(value, base_url)
         elif tag == "#EXT-X-BYTERANGE":
@@ -143,11 +160,9 @@ def parse_playlist(text: str, base_url: str) -> PlaylistInfo:
         elif tag == "#EXT-X-DISCONTINUITY":
             warnings.append("播放列表包含 #EXT-X-DISCONTINUITY，拼接后的时间戳可能存在不连续。")
         elif tag == "#EXT-X-SESSION-KEY":
-            method = (_parse_attributes(value).get("METHOD", "") or "").upper()
-            if method not in _UNENCRYPTED_METHODS:
-                raise UnsupportedEncryptionError(
-                    f"播放列表使用加密方式 {method} 保护分片，当前版本只支持未加密的播放列表。"
-                )
+            # 会话密钥只用于主播放列表，出现在媒体列表里时不作用于任何分片，
+            # 但仍要过一遍校验，免得漏掉不支持的加密方式。
+            _parse_key(value, base_url)
 
     if not segments:
         raise InvalidPlaylistError("播放列表中没有找到任何分片地址，请确认链接指向的是媒体播放列表。")
@@ -184,6 +199,13 @@ def _classify_segments(
     suffixes = {get_extension(segment.url) for segment in segments}
     known = {suffix for suffix in suffixes if suffix}
 
+    non_media = known & _NON_MEDIA_SUFFIXES
+    if non_media:
+        listed = "、".join(sorted(non_media))
+        raise UnsupportedSegmentError(
+            f"播放列表包含非视频分片（{listed}），当前版本仅支持下载视频。"
+        )
+
     if known and known <= _AUDIO_ONLY_SUFFIXES:
         raise UnsupportedSegmentError(
             "该播放列表看起来只包含音频分片，当前版本仅支持下载视频。"
@@ -213,6 +235,41 @@ def _classify_segments(
         "无法从分片地址判断容器格式（可能存在没有扩展名的分片），将按二进制拼接处理。"
     )
     return SegmentKind.UNKNOWN
+
+
+def _parse_key(value: str, base_url: str) -> EncryptionKey | None:
+    """解析 ``#EXT-X-KEY``。
+
+    Returns:
+        当前生效的密钥；``METHOD=NONE``（即取消加密）时返回 ``None``。
+
+    Raises:
+        UnsupportedEncryptionError: 加密方式当前版本没有实现。
+    """
+    attributes = _parse_attributes(value)
+    method = (attributes.get("METHOD") or "").strip().upper()
+
+    if method in _UNENCRYPTED_METHODS:
+        return None
+
+    if method not in _SUPPORTED_ENCRYPTION_METHODS:
+        supported = "、".join(sorted(_SUPPORTED_ENCRYPTION_METHODS))
+        raise UnsupportedEncryptionError(
+            f"播放列表使用加密方式 {method}，当前版本只实现了 {supported}。"
+        )
+
+    uri = attributes.get("URI")
+    if not uri:
+        raise UnsupportedEncryptionError(
+            "播放列表声明了 AES-128 加密，但没有给出密钥地址（URI 属性）。"
+        )
+
+    return EncryptionKey(
+        method=method,
+        uri=resolve_url(base_url, uri),
+        iv=attributes.get("IV") or None,
+        key_format=(attributes.get("KEYFORMAT") or "").strip() or None,
+    )
 
 
 def _resolve_map_uri(value: str, base_url: str) -> str | None:
