@@ -67,6 +67,8 @@ def _shared_window():
 @pytest.fixture
 def window(_shared_window):
     """每个用例拿到一个状态干净的窗口。"""
+    from gui import main_window as mw
+
     win = _shared_window
 
     win._closing = False
@@ -83,6 +85,8 @@ def window(_shared_window):
     win.optional_b_entry.set("")
     win.filename_entry.set("video.ts")
     win.overwrite_var.set(False)
+    win.resume_var.set(True)
+    win.workers_var.set(str(mw.DEFAULT_WORKERS))
     win.dir_entry.set(str(win._default_output_dir()))
 
     while not win._message_queue.empty():
@@ -250,10 +254,21 @@ def test_body_stacks_when_narrow(window):
 
 
 def test_toplevel_resize_switches_layout(window):
-    window._on_configure(_FakeConfigure(window, 1400))
+    """阈值是逻辑像素，事件里的宽度是物理像素，必须换算后再比。
+
+    高 DPI（缩放 1.5）下如果直接比，窗口已经窄到放不下双栏了还停在双栏。
+    """
+    import customtkinter as ctk
+
+    from gui import theme
+
+    scaling = ctk.ScalingTracker.get_widget_scaling(window) or 1.0
+    threshold = theme.NARROW_WIDTH_THRESHOLD
+
+    window._on_configure(_FakeConfigure(window, int((threshold + 200) * scaling)))
     assert window._wide is True
 
-    window._on_configure(_FakeConfigure(window, 800))
+    window._on_configure(_FakeConfigure(window, int((threshold - 200) * scaling)))
     assert window._wide is False
     assert int(window._right_column.grid_info()["row"]) == 1
 
@@ -405,7 +420,7 @@ def test_start_recovers_when_worker_thread_cannot_start(window, monkeypatch, tmp
 
 
 def test_worker_uses_the_window_owned_temp_directory(window, monkeypatch, tmp_path):
-    """后台任务必须使用窗口自己持有的临时根目录。
+    """关闭续传时，后台任务必须使用窗口自己持有的临时根目录。
 
     否则任务线程被强杀时，核心的清理逻辑来不及执行，临时分片会永久残留在
     系统临时目录里——窗口自己持有才可能在关闭时兜底清理。
@@ -420,6 +435,7 @@ def test_worker_uses_the_window_owned_temp_directory(window, monkeypatch, tmp_pa
 
     monkeypatch.setattr(mw, "download_hls_video", fake)
     _prepare(window, tmp_path)
+    window.resume_var.set(False)
 
     window._on_start()
     assert _pump(window, lambda: not window._is_running())
@@ -427,3 +443,29 @@ def test_worker_uses_the_window_owned_temp_directory(window, monkeypatch, tmp_pa
     assert window._temp_root is not None, "窗口没有持有临时根目录"
     assert captured.get("temp_dir") == str(window._temp_root)
     assert window._temp_root.is_dir(), "临时根目录应当真实存在"
+
+
+def test_worker_lets_the_core_place_resume_segments(window, monkeypatch, tmp_path):
+    """开启续传（默认）时不再使用会话临时目录。
+
+    会话目录在关闭窗口时会被删除，放在里面的分片根本留不到下次运行，
+    续传也就无从谈起。
+    """
+    from gui import main_window as mw
+
+    captured: dict = {}
+
+    def fake(**kwargs):
+        captured.update(kwargs)
+        raise HLSDownloaderError("测试结束")
+
+    monkeypatch.setattr(mw, "download_hls_video", fake)
+    _prepare(window, tmp_path)
+    assert window.resume_var.get() is True
+
+    window._on_start()
+    assert _pump(window, lambda: not window._is_running())
+
+    assert captured.get("resume") is True
+    assert captured.get("temp_dir") is None
+    assert captured.get("workers") == mw.DEFAULT_WORKERS

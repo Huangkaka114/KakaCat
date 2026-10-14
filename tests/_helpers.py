@@ -85,7 +85,12 @@ class FakeSession:
         self.routes: dict[str, object] = dict(routes or {})
         self.requests: list[tuple[str, dict]] = []
         self.headers: dict[str, str] = {}
+        self.adapters: dict[str, object] = {}
         self.closed = False
+
+    def mount(self, prefix: str, adapter) -> None:
+        """接口与 ``requests.Session`` 对齐；假会话没有真正的连接池。"""
+        self.adapters[prefix] = adapter
 
     def get(self, url: str, **kwargs) -> FakeResponse:
         self.requests.append((url, kwargs))

@@ -185,72 +185,110 @@ class LabeledEntry(ctk.CTkFrame):
 
 
 class _Metric(ctk.CTkFrame):
-    """状态面板中的一个指标（标题 + 数值）。"""
+    """状态面板中的一个指标（标题 + 数值）。
 
-    def __init__(self, master, fonts: Fonts, caption: str, **kwargs):
-        kwargs.setdefault("fg_color", "transparent")
+    ``tile=True`` 时带底色与圆角，成为一块独立的小磁贴；用于横跨整窗的状态带。
+    """
+
+    def __init__(
+        self, master, fonts: Fonts, caption: str, *, tile: bool = False, **kwargs
+    ):
+        kwargs.setdefault("fg_color", theme.BG_INPUT if tile else "transparent")
+        if tile:
+            kwargs.setdefault("corner_radius", theme.RADIUS_INPUT)
         super().__init__(master, **kwargs)
+
+        pad = theme.SPACE_SM if tile else 0
+        self.columnconfigure(0, weight=1)
         ctk.CTkLabel(
             self, text=caption, font=fonts.hint, text_color=theme.TEXT_DIM, anchor="w"
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="ew", padx=pad, pady=(pad, 0))
         self.value = ctk.CTkLabel(
             self, text="—", font=fonts.metric, text_color=theme.TEXT, anchor="w"
         )
-        self.value.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.value.grid(row=1, column=0, sticky="ew", padx=pad, pady=(2, pad))
 
     def set(self, text: str, color: str = theme.TEXT) -> None:
         self.value.configure(text=text, text_color=color)
 
 
+def _badge_text(text: str) -> str:
+    """给徽标文字补两侧留白。
+
+    ``CTkLabel`` 没有内边距选项，胶囊底色会紧贴文字，因此用空格把视觉留白
+    补出来。
+    """
+    return f"   {text}   "
+
+
 class StatusPanel(Card):
-    """显示任务阶段、进度、分片数量、速度和预计剩余时间。"""
+    """显示任务阶段、进度、分片数量、速度和预计剩余时间。
+
+    布局按「横跨整个窗口的状态带」设计：左上角是分区标题与阶段徽标，右上角是
+    大号百分比，下面依次是加粗的进度条、提示文字和四块指标磁贴。
+    """
 
     def __init__(self, master, fonts: Fonts, **kwargs):
         super().__init__(master, **kwargs)
         self._fonts = fonts
         self.columnconfigure(0, weight=1)
 
-        SectionTitle(self, "下载状态", fonts).grid(
-            row=0, column=0, sticky="w", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, theme.SPACE_SM)
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(
+            row=0, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, theme.SPACE_SM)
         )
+        header.columnconfigure(2, weight=1)
+
+        SectionTitle(header, "下载状态", fonts).grid(row=0, column=0, sticky="w")
 
         self._stage_label = ctk.CTkLabel(
-            self, text=TaskStage.IDLE.label, font=fonts.body_bold, text_color=theme.TEXT, anchor="w"
+            header,
+            text=_badge_text(TaskStage.IDLE.label),
+            font=fonts.hint,
+            text_color=theme.ACCENT,
+            fg_color=theme.BG_HOVER,
+            corner_radius=11,
+            height=24,
         )
-        self._stage_label.grid(row=1, column=0, sticky="ew", padx=theme.SPACE_LG)
+        self._stage_label.grid(row=0, column=1, sticky="w", padx=(theme.SPACE_MD, 0))
+
+        self._percent_display = ctk.CTkLabel(
+            header, text="0.0%", font=fonts.display, text_color=theme.ACCENT, anchor="e"
+        )
+        self._percent_display.grid(row=0, column=3, sticky="e")
 
         self._progress_bar = ctk.CTkProgressBar(
             self,
-            height=10,
-            corner_radius=5,
+            height=14,
+            corner_radius=7,
             fg_color=theme.PROGRESS_TRACK,
             progress_color=theme.ACCENT,
         )
         self._progress_bar.set(0.0)
         self._progress_bar.grid(
-            row=2, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, theme.SPACE_XS)
+            row=1, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_SM)
         )
 
         self._message_label = ctk.CTkLabel(
             self, text="等待开始", font=fonts.hint, text_color=theme.TEXT_DIM, anchor="w"
         )
-        self._message_label.grid(row=3, column=0, sticky="ew", padx=theme.SPACE_LG)
+        self._message_label.grid(row=2, column=0, sticky="ew", padx=theme.SPACE_LG)
 
         metrics = ctk.CTkFrame(self, fg_color="transparent")
         metrics.grid(
-            row=4, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, theme.SPACE_LG)
+            row=3, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, theme.SPACE_MD)
         )
         for column in range(4):
-            metrics.columnconfigure(column, weight=1)
+            metrics.columnconfigure(column, weight=1, uniform="metric")
 
-        self._percent = _Metric(metrics, fonts, "进度")
-        self._percent.grid(row=0, column=0, sticky="w")
-        self._segments = _Metric(metrics, fonts, "分片")
-        self._segments.grid(row=0, column=1, sticky="w")
-        self._speed = _Metric(metrics, fonts, "速度")
-        self._speed.grid(row=0, column=2, sticky="w")
-        self._eta = _Metric(metrics, fonts, "剩余时间")
-        self._eta.grid(row=0, column=3, sticky="w")
+        self._percent = _Metric(metrics, fonts, "进度", tile=True)
+        self._percent.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_SM))
+        self._segments = _Metric(metrics, fonts, "分片", tile=True)
+        self._segments.grid(row=0, column=1, sticky="ew", padx=theme.SPACE_SM)
+        self._speed = _Metric(metrics, fonts, "速度", tile=True)
+        self._speed.grid(row=0, column=2, sticky="ew", padx=theme.SPACE_SM)
+        self._eta = _Metric(metrics, fonts, "剩余时间", tile=True)
+        self._eta.grid(row=0, column=3, sticky="ew", padx=(theme.SPACE_SM, 0))
 
     # -- 状态更新 ---------------------------------------------------------
 
@@ -308,17 +346,20 @@ class StatusPanel(Card):
         )
 
     def show_failed(self, message: str) -> None:
-        self._stage_label.configure(text=TaskStage.FAILED.label, text_color=theme.ERROR)
+        self._set_stage(TaskStage.FAILED, theme.ERROR)
         self._message_label.configure(text=message.splitlines()[0] if message else "下载失败")
         self._progress_bar.configure(progress_color=theme.ERROR)
 
     def show_cancelled(self) -> None:
-        self._stage_label.configure(text=TaskStage.CANCELLED.label, text_color=theme.WARNING)
+        self._set_stage(TaskStage.CANCELLED, theme.WARNING)
         self._message_label.configure(text="任务已取消，临时文件已清理。")
         self._progress_bar.configure(progress_color=theme.WARNING)
 
     def show_stage(self, stage: TaskStage) -> None:
-        self._stage_label.configure(text=stage.label, text_color=theme.WARNING)
+        self._set_stage(stage, theme.WARNING)
+
+    def _set_stage(self, stage: TaskStage, color: str) -> None:
+        self._stage_label.configure(text=_badge_text(stage.label), text_color=color)
 
     # -- 内部实现 ---------------------------------------------------------
 
@@ -334,11 +375,13 @@ class StatusPanel(Card):
         eta: str,
         percent_text: str | None = None,
     ) -> None:
-        self._stage_label.configure(text=stage.label, text_color=color)
+        self._set_stage(stage, color)
         self._message_label.configure(text=message)
         self._progress_bar.configure(progress_color=color)
         self._progress_bar.set(max(0.0, min(1.0, percent)))
-        self._percent.set(percent_text or f"{percent * 100:.1f}%", color)
+        text = percent_text or f"{percent * 100:.1f}%"
+        self._percent.set(text, color)
+        self._percent_display.configure(text=text, text_color=color)
         self._segments.set(segments)
         self._speed.set(speed)
         self._eta.set(eta)
@@ -380,6 +423,7 @@ class LogPanel(Card):
 
         self.textbox = ctk.CTkTextbox(
             self,
+            height=150,
             font=fonts.log,
             fg_color=theme.BG_LOG,
             border_width=1,

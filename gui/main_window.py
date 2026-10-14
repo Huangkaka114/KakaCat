@@ -21,13 +21,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from tkinter import BooleanVar, filedialog, messagebox
+from tkinter import BooleanVar, StringVar, filedialog, messagebox
 from urllib.parse import urlsplit
 
 import customtkinter as ctk
 
 from hls_downloader import __version__
-from hls_downloader.downloader import download_hls_video
+from hls_downloader.downloader import DEFAULT_WORKERS, MAX_WORKERS, download_hls_video
 from hls_downloader.merger import find_ffmpeg
 from hls_downloader.models import (
     DownloadCancelled,
@@ -63,6 +63,16 @@ MSG_PROGRESS = "progress"
 MSG_DONE = "done"
 MSG_FAILED = "failed"
 MSG_CANCELLED = "cancelled"
+
+def _stretch_to_viewport(card) -> None:
+    """让可滚动区域里的卡片横向铺满视口。
+
+    ``customtkinter`` 6.0 把可滚动内容框架的列权重留成了 0，卡片会按自身请求
+    宽度摆放，右边空出一条——标题栏、输入框全都被挤在左侧一小块里。
+    这里把它所在列的权重补上。放在普通框架里调用也无副作用。
+    """
+    card.master.grid_columnconfigure(0, weight=1)
+
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED_NAMES = {
@@ -177,15 +187,27 @@ class MainWindow(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=3)
-        self.grid_rowconfigure(2, weight=2)
+        self.grid_rowconfigure(0, weight=0)  # 标题栏
+        # 表单与日志都用 minsize 保住各自的最低可用高度：只给 weight 的话，
+        # 窗口一矮就先饿死表单，日志反而比表单还高。
+        self.grid_rowconfigure(1, weight=5, minsize=390)  # 下载设置 + 支持信息
+        self.grid_rowconfigure(2, weight=0)  # 全宽状态带
+        self.grid_rowconfigure(3, weight=2, minsize=150)  # 运行日志
 
         self._build_header()
         self._build_body()
+
+        # 状态带横跨整个窗口，放在设置区与日志之间：既占满了中间原本空着
+        # 的地方，也让进度成为视线焦点。
+        self.status_panel = StatusPanel(self, self._fonts)
+        self.status_panel.grid(
+            row=2, column=0, sticky="ew",
+            padx=theme.SPACE_LG, pady=(0, theme.SPACE_MD),
+        )
+
         self.log_panel = LogPanel(self, self._fonts)
         self.log_panel.grid(
-            row=2, column=0, sticky="nsew",
+            row=3, column=0, sticky="nsew",
             padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG),
         )
 
@@ -244,18 +266,43 @@ class MainWindow(ctk.CTk):
         self._body.rowconfigure(0, weight=1)
         self._body.rowconfigure(1, weight=0)
 
-        self._left_column = ctk.CTkScrollableFrame(
-            self._body, fg_color="transparent", corner_radius=0
-        )
-        self._right_column = self._build_info_panel()
+        # 左栏：表单可滚动，但「开始 / 取消」固定在下方，窗口再矮也不用翻到
+        # 卡片底部才点得到。
+        self._left_column = ctk.CTkFrame(self._body, fg_color="transparent")
+        self._left_column.columnconfigure(0, weight=1)
+        self._left_column.rowconfigure(0, weight=1)
 
-        self._build_settings_card(self._left_column)
-        self.status_panel = StatusPanel(self._left_column, self._fonts)
-        self.status_panel.grid(row=1, column=0, sticky="ew", pady=(theme.SPACE_MD, 0))
+        form = ctk.CTkScrollableFrame(
+            self._left_column,
+            fg_color="transparent",
+            corner_radius=0,
+            height=372,
+            # 滚动条压暗到几乎看不见：默认窗口下表单正好放得下，它只是
+            # 窗口变矮时的兜底，不该抢视线。
+            scrollbar_fg_color="transparent",
+            scrollbar_button_color=theme.BG_PANEL,
+            scrollbar_button_hover_color=theme.BORDER_STRONG,
+        )
+        form.grid(row=0, column=0, sticky="nsew")
+        self._build_settings_card(form)
+        self._build_action_bar(self._left_column)
+
+        # 右栏也用可滚动容器：窗口拉小时内容不会被裁掉（快捷操作按钮曾经因为
+        # 高度不够而直接看不见）。
+        self._right_column = ctk.CTkScrollableFrame(
+            self._body,
+            fg_color="transparent",
+            corner_radius=0,
+            scrollbar_fg_color="transparent",
+            scrollbar_button_color=theme.BG_PANEL,
+            scrollbar_button_hover_color=theme.BORDER_STRONG,
+        )
+        self._build_info_panel(self._right_column)
 
     def _build_settings_card(self, parent) -> None:
         card = Card(parent)
         card.grid(row=0, column=0, sticky="ew")
+        _stretch_to_viewport(card)
         card.columnconfigure(0, weight=1)
 
         SectionTitle(card, "下载设置", self._fonts).grid(
@@ -268,37 +315,48 @@ class MainWindow(ctk.CTk):
             self._fonts,
             label="视频 URL（M3U8）",
             placeholder="https://example.com/video/index.m3u8",
-            hint="仅接受 HTTP/HTTPS 链接，且必须是具体的媒体播放列表。",
         )
         self.url_entry.grid(row=1, column=0, sticky="ew", padx=theme.SPACE_LG)
         self.url_entry.entry.bind("<FocusOut>", self._on_url_focus_out)
         self.url_entry.entry.bind("<Return>", lambda _event: self._on_start())
 
-        self.optional_a_entry = LabeledEntry(
-            card,
-            self._fonts,
-            label="可选参数 A（可选）",
-            placeholder="可留空",
-            hint="当前版本暂不处理，仅记录输入值，不会拼接到任何请求中。",
-        )
-        self.optional_a_entry.grid(
+        # 两个可选参数并排：都是短字段，并排既省纵向空间也让「可选」的分量
+        # 一目了然。
+        optional_row = ctk.CTkFrame(card, fg_color="transparent")
+        optional_row.grid(
             row=2, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, 0)
         )
+        optional_row.columnconfigure(0, weight=1, uniform="optional")
+        optional_row.columnconfigure(1, weight=1, uniform="optional")
+
+        self.optional_a_entry = LabeledEntry(
+            optional_row,
+            self._fonts,
+            label="可选参数 A（授权密钥）",
+            placeholder="可留空",
+        )
+        self.optional_a_entry.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_SM))
 
         self.optional_b_entry = LabeledEntry(
-            card,
+            optional_row,
             self._fonts,
-            label="可选参数 B（可选）",
+            label="可选参数 B（基础地址）",
             placeholder="可留空",
-            hint="当前版本暂不处理，仅记录输入值，不会拼接到任何请求中。",
         )
-        self.optional_b_entry.grid(
+        self.optional_b_entry.grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_SM, 0))
+
+        # 保存位置并排：目录与文件名本来就是一回事（存到哪、叫什么），
+        # 并排后整张表少一行，默认窗口下不用滚动就能看到开始按钮。
+        output_row = ctk.CTkFrame(card, fg_color="transparent")
+        output_row.grid(
             row=3, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, 0)
         )
+        output_row.columnconfigure(0, weight=3)
+        output_row.columnconfigure(1, weight=2)
 
         default_dir = str(self._default_output_dir())
         self.dir_entry = LabeledEntry(
-            card,
+            output_row,
             self._fonts,
             label="保存目录",
             placeholder="选择保存目录",
@@ -307,26 +365,27 @@ class MainWindow(ctk.CTk):
             button_width=88,
         )
         self.dir_entry.set(default_dir)
-        self.dir_entry.grid(
-            row=4, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, 0)
-        )
+        self.dir_entry.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_SM))
 
         self.filename_entry = LabeledEntry(
-            card,
+            output_row,
             self._fonts,
             label="输出文件名",
             placeholder="video.ts",
-            hint="扩展名决定封装方式：.ts 直接拼接，.mp4 需要 FFmpeg 重新封装。",
         )
         self.filename_entry.set("video.ts")
         self.filename_entry.entry.bind("<KeyRelease>", self._on_filename_edited)
-        self.filename_entry.grid(
+        self.filename_entry.grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_SM, 0))
+
+        options = ctk.CTkFrame(card, fg_color="transparent")
+        options.grid(
             row=5, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, 0)
         )
+        options.columnconfigure(2, weight=1)
 
         self.overwrite_var = BooleanVar(value=False)
         self.overwrite_check = ctk.CTkCheckBox(
-            card,
+            options,
             text="允许覆盖已有文件",
             variable=self.overwrite_var,
             font=self._fonts.small,
@@ -338,14 +397,54 @@ class MainWindow(ctk.CTk):
             checkbox_width=18,
             checkbox_height=18,
         )
-        self.overwrite_check.grid(
-            row=6, column=0, sticky="w", padx=theme.SPACE_LG, pady=(theme.SPACE_MD, 0)
-        )
+        self.overwrite_check.grid(row=0, column=0, sticky="w")
 
-        actions = ctk.CTkFrame(card, fg_color="transparent")
-        actions.grid(
-            row=7, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_LG, theme.SPACE_LG)
+        self.resume_var = BooleanVar(value=True)
+        self.resume_check = ctk.CTkCheckBox(
+            options,
+            text="断点续传",
+            variable=self.resume_var,
+            font=self._fonts.small,
+            text_color=theme.TEXT_SECONDARY,
+            fg_color=theme.PRIMARY,
+            hover_color=theme.PRIMARY_HOVER,
+            border_color=theme.BORDER_STRONG,
+            corner_radius=4,
+            checkbox_width=18,
+            checkbox_height=18,
         )
+        self.resume_check.grid(row=0, column=1, sticky="w", padx=(theme.SPACE_LG, 0))
+
+        ctk.CTkLabel(
+            options,
+            text="并发分片数",
+            font=self._fonts.small,
+            text_color=theme.TEXT_SECONDARY,
+        ).grid(row=0, column=3, sticky="e", padx=(theme.SPACE_LG, theme.SPACE_SM))
+        self.workers_var = StringVar(value=str(DEFAULT_WORKERS))
+        self.workers_menu = ctk.CTkOptionMenu(
+            options,
+            values=[str(count) for count in (1, 2, 4, 8, MAX_WORKERS)],
+            variable=self.workers_var,
+            width=72,
+            height=26,
+            font=self._fonts.small,
+            dropdown_font=self._fonts.small,
+            fg_color=theme.BG_INPUT,
+            button_color=theme.BG_INPUT_FOCUS,
+            button_hover_color=theme.BG_HOVER,
+            text_color=theme.TEXT,
+        )
+        self.workers_menu.grid(row=0, column=4, sticky="e")
+
+    def _build_action_bar(self, parent) -> None:
+        """固定在左栏底部的操作条：开始 / 取消。"""
+        bar = Card(parent)
+        bar.grid(row=1, column=0, sticky="ew", pady=(theme.SPACE_SM, 0))
+        bar.columnconfigure(0, weight=1)
+
+        actions = ctk.CTkFrame(bar, fg_color="transparent")
+        actions.grid(row=0, column=0, sticky="ew", padx=theme.SPACE_LG, pady=theme.SPACE_LG)
         actions.columnconfigure(0, weight=3)
         actions.columnconfigure(1, weight=2)
 
@@ -378,8 +477,10 @@ class MainWindow(ctk.CTk):
         )
         self.cancel_button.grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_SM, 0))
 
-    def _build_info_panel(self) -> Card:
-        panel = Card(self._body)
+    def _build_info_panel(self, parent) -> None:
+        panel = Card(parent)
+        panel.grid(row=0, column=0, sticky="ew")
+        _stretch_to_viewport(panel)
         panel.columnconfigure(0, weight=1)
 
         SectionTitle(panel, "支持的播放列表", self._fonts).grid(
@@ -389,14 +490,14 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(
             panel,
             text=(
-                "HLS 点播（VOD）媒体播放列表，支持 TS 与 fMP4/CMAF 分片，"
-                "并支持整段 AES-128 加密。"
+                "HLS 点播（VOD）媒体播放列表，支持 TS 与 fMP4/CMAF 分片，并支持整段 "
+                "AES-128 加密；链接只接受 HTTP/HTTPS。"
             ),
             font=self._fonts.small,
             text_color=theme.TEXT_SECONDARY,
             justify="left",
             anchor="w",
-            wraplength=250,
+            wraplength=380,
         ).grid(row=1, column=0, sticky="ew", padx=theme.SPACE_LG)
 
         SectionTitle(panel, "当前版本限制", self._fonts).grid(
@@ -410,13 +511,14 @@ class MainWindow(ctk.CTk):
                 "• 不支持直播或尚未结束的列表\n"
                 "• 加密方面只实现整段 AES-128，其余方式会报错\n"
                 "• 不支持 #EXT-X-BYTERANGE 分片\n"
-                "• 可选参数 A / B 当前版本不处理"
+                "• 可选参数 A 是授权密钥，参数 B 是服务基础地址；填写参数 B 时，"
+                "上面的链接可以填下载链接"
             ),
             font=self._fonts.small,
             text_color=theme.TEXT_SECONDARY,
             justify="left",
             anchor="w",
-            wraplength=250,
+            wraplength=380,
         ).grid(row=3, column=0, sticky="ew", padx=theme.SPACE_LG)
 
         SectionTitle(panel, "运行环境", self._fonts).grid(
@@ -427,14 +529,13 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(
             panel,
             text=(
-                f"FFmpeg：{'已检测到' if ffmpeg else '未检测到'}\n"
-                + ("可封装 MP4 输出。" if ffmpeg else "仅支持直接拼接 .ts 输出。")
+                f"FFmpeg：{'已检测到，可封装 MP4。' if ffmpeg else '未检测到，只能直接拼接 .ts。'}"
             ),
             font=self._fonts.small,
             text_color=theme.SUCCESS if ffmpeg else theme.WARNING,
             justify="left",
             anchor="w",
-            wraplength=250,
+            wraplength=380,
         ).grid(row=5, column=0, sticky="ew", padx=theme.SPACE_LG)
 
         SectionTitle(panel, "快捷操作", self._fonts).grid(
@@ -442,8 +543,15 @@ class MainWindow(ctk.CTk):
             padx=theme.SPACE_LG, pady=(theme.SPACE_LG, theme.SPACE_SM),
         )
 
+        shortcuts = ctk.CTkFrame(panel, fg_color="transparent")
+        shortcuts.grid(
+            row=7, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG)
+        )
+        shortcuts.columnconfigure(0, weight=1, uniform="shortcut")
+        shortcuts.columnconfigure(1, weight=1, uniform="shortcut")
+
         ctk.CTkButton(
-            panel,
+            shortcuts,
             text="打开输出目录",
             font=self._fonts.small,
             height=32,
@@ -454,10 +562,10 @@ class MainWindow(ctk.CTk):
             border_width=1,
             border_color=theme.BORDER,
             command=self._open_output_dir,
-        ).grid(row=7, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_SM))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_SM))
 
         ctk.CTkButton(
-            panel,
+            shortcuts,
             text="查看运行日志",
             font=self._fonts.small,
             height=32,
@@ -468,9 +576,7 @@ class MainWindow(ctk.CTk):
             border_width=1,
             border_color=theme.BORDER,
             command=lambda: self.log_panel.scroll_to_end(),
-        ).grid(row=8, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG))
-
-        return panel
+        ).grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_SM, 0))
 
     def _apply_responsive_layout(self, *, wide: bool) -> None:
         """窗口足够宽时左右双栏，否则改为单栏堆叠。"""
@@ -481,7 +587,10 @@ class MainWindow(ctk.CTk):
         self._right_column.grid_forget()
 
         if wide:
-            self._body.columnconfigure(0, weight=1)
+            # 右栏必须给权重和最小宽度：只靠 sticky 的话它会缩到可滚动容器的
+            # 默认宽度（200px），右栏文字被卡片边缘切掉。
+            self._body.columnconfigure(0, weight=3)
+            self._body.columnconfigure(1, weight=2, minsize=300)
             self._left_column.grid(row=0, column=0, sticky="nsew", padx=(0, theme.SPACE_MD))
             self._right_column.grid(row=0, column=1, sticky="nsew")
         else:
@@ -494,13 +603,16 @@ class MainWindow(ctk.CTk):
     def _on_configure(self, event) -> None:
         if event.widget is not self:
             return
-        wide = event.width >= theme.NARROW_WIDTH_THRESHOLD
+        # event.width 是物理像素，而阈值是逻辑像素：不换算的话，在 125%/150%
+        # 缩放的屏幕上永远跨不过阈值，窗口已经很窄了还硬撑双栏。
+        scaling = ctk.ScalingTracker.get_widget_scaling(self) or 1.0
+        wide = event.width / scaling >= theme.NARROW_WIDTH_THRESHOLD
         if wide == self._wide:
             return
         self._wide = wide
         self._apply_responsive_layout(wide=wide)
 
-    def _center_window(self, width: int = 1180, height: int = 880) -> None:
+    def _center_window(self, width: int = 1180, height: int = 940) -> None:
         self.update_idletasks()
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
@@ -584,20 +696,35 @@ class MainWindow(ctk.CTk):
 
         optional_a = self.optional_a_entry.get().strip() or None
         optional_b = self.optional_b_entry.get().strip() or None
-        if optional_a or optional_b:
+        if optional_a:
             self.log_panel.append(
-                "已记录可选参数 A/B（当前版本不处理，也不会发送到任何请求中）。", "warn"
+                "已填写参数 A：将为 M3U8 请求生成签名（密钥不会写入日志）。", "info"
             )
+        if optional_b and not optional_a:
+            self.log_panel.append(
+                "只填写了参数 B（基础地址），缺少参数 A（密钥），本次按原始链接请求。", "warn"
+            )
+
+        resume = bool(self.resume_var.get())
+        try:
+            workers = int(self.workers_var.get())
+        except ValueError:
+            workers = DEFAULT_WORKERS
+            self.workers_var.set(str(DEFAULT_WORKERS))
+        workers = min(max(1, workers), MAX_WORKERS)
 
         self._cancel_event = threading.Event()
         self.status_panel.reset()
+        self.log_panel.append(
+            f"下载参数：{workers} 路并发，断点续传{'开' if resume else '关'}。", "info"
+        )
         self.log_panel.append(f"开始下载：{output_path}", "info")
 
         self._set_running(True)
         try:
             self._worker = threading.Thread(
                 target=self._worker_main,
-                args=(url, str(output_path), optional_a, optional_b, overwrite),
+                args=(url, str(output_path), optional_a, optional_b, overwrite, resume, workers),
                 name="hls-download",
                 daemon=True,
             )
@@ -671,6 +798,8 @@ class MainWindow(ctk.CTk):
         ):
             widget.set_enabled(not running)
         self.overwrite_check.configure(state="disabled" if running else "normal")
+        self.resume_check.configure(state="disabled" if running else "normal")
+        self.workers_menu.configure(state="disabled" if running else "normal")
 
     def _worker_main(
         self,
@@ -679,6 +808,8 @@ class MainWindow(ctk.CTk):
         optional_a: str | None,
         optional_b: str | None,
         overwrite: bool,
+        resume: bool,
+        workers: int,
     ) -> None:
         """后台线程入口：只调用核心函数并通过队列汇报结果。"""
         handler = _QueueLogHandler(self._message_queue)
@@ -697,7 +828,13 @@ class MainWindow(ctk.CTk):
                 progress_callback=self._emit_progress,
                 cancel_event=self._cancel_event,
                 overwrite=overwrite,
-                temp_dir=str(self._temp_root) if self._temp_root else None,
+                workers=workers,
+                resume=resume,
+                # 开启续传时不能把分片放进「关闭窗口就删除」的会话目录，
+                # 否则重启程序后续不上；交给核心放到系统临时目录下的固定位置。
+                temp_dir=(
+                    str(self._temp_root) if (self._temp_root and not resume) else None
+                ),
                 logger=task_logger,
             )
         except DownloadCancelled:

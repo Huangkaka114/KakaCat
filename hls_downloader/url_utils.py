@@ -57,6 +57,18 @@ def resolve_url(base_url: str, reference: str) -> str:
     return urljoin(base_url, ref)
 
 
+def without_query(url: str) -> str:
+    """去掉查询串与锚点，只保留协议、主机和路径。
+
+    用于生成与签名无关的稳定标识：``wsTime`` 之类的参数每次都不一样，
+    直接拿完整 URL 比较会导致永远对不上。
+    """
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return url
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
 def get_extension(url: str) -> str:
     """返回 URL 路径部分的小写扩展名（含点），没有则返回空字符串。"""
     path = urlsplit(url).path

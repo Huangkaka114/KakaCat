@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
 import requests
 
-from hls_downloader import downloader
+from hls_downloader import downloader, util
 from hls_downloader.models import (
     DownloadCancelled,
     HLSDownloaderError,
@@ -92,6 +93,22 @@ def test_internally_created_session_is_closed(tmp_path, monkeypatch):
     assert result.segment_count == 3
     assert session.closed is True
     assert "User-Agent" in session.headers
+
+
+def test_internal_session_pool_is_sized_for_the_worker_count(tmp_path, monkeypatch):
+    """连接池要按并发数放大。
+
+    requests 默认每主机只池化 10 条连接，并发超过它时多出来的连接用完即弃，
+    每个分片都要重做一次 TCP + TLS 握手——这是高并发反而快不起来的原因之一。
+    """
+    session = make_session()
+    monkeypatch.setattr(downloader.requests, "Session", lambda: session)
+
+    downloader.download_hls_video(PLAYLIST_URL, tmp_path / "out.ts", workers=8)
+
+    adapter = session.adapters["https://"]
+    assert adapter._pool_maxsize >= 8
+    assert set(session.adapters) == {"http://", "https://"}
 
 
 def test_fmp4_init_segment_is_downloaded_first(tmp_path):
@@ -214,13 +231,12 @@ def test_runs_when_optional_parameters_are_empty(tmp_path, optional_a, optional_
     assert result.segment_count == 3
 
 
-def test_optional_parameters_are_never_sent_anywhere(tmp_path):
+def test_optional_parameter_b_is_never_sent_anywhere(tmp_path):
     session = make_session()
 
     downloader.download_hls_video(
         PLAYLIST_URL,
         tmp_path / "out.ts",
-        optional_a="SECRET-A",
         optional_b="SECRET-B",
         session=session,
     )
@@ -229,6 +245,156 @@ def test_optional_parameters_are_never_sent_anywhere(tmp_path):
         assert "SECRET" not in url
         assert "SECRET" not in repr(kwargs)
     assert "SECRET" not in repr(session.headers)
+
+
+#: 参数 A 的测试密钥：只在本地参与签名，任何请求或日志里都不应出现原文。
+SECRET_A = "KEY-9f3c2b"
+FIXED_NOW = 1_700_000_000.0
+
+
+class _FixedClock:
+    """把 ``util.time`` 换成固定时钟，让签名里的 wsTime 可预期。"""
+
+    @staticmethod
+    def time() -> float:
+        return FIXED_NOW
+
+
+def _signed_playlist_session() -> tuple[str, FakeSession]:
+    signed = util.rebuild_url(PLAYLIST_URL, SECRET_A)
+    routes: dict[str, object] = {signed: FakeResponse(body=build_media_playlist(NAMES))}
+    routes.update(build_segment_routes(BASE, NAMES))
+    return signed, FakeSession(routes)
+
+
+def test_optional_a_signs_the_playlist_request_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(util, "time", _FixedClock)
+    signed, session = _signed_playlist_session()
+
+    result = downloader.download_hls_video(
+        PLAYLIST_URL,
+        tmp_path / "out.ts",
+        optional_a=SECRET_A,
+        session=session,
+    )
+
+    assert result.segment_count == 3
+    # 播放列表用的是重签名后的 URL，wsTime 取「当前时间 + 有效期」。
+    assert session.requested_urls[0] == signed
+    assert f"wsTime={int(FIXED_NOW) + util.CLIENT_WS_TTL}" in signed
+    # 分片仍按播放列表里给出的原地址请求，不带签名。
+    assert sorted(session.requested_urls[1:]) == sorted(f"{BASE}{name}" for name in NAMES)
+
+
+@pytest.mark.parametrize("optional_a", [None, "", "   "])
+def test_without_optional_a_the_url_is_requested_as_given(tmp_path, optional_a):
+    session = make_session()
+
+    downloader.download_hls_video(
+        PLAYLIST_URL,
+        tmp_path / "out.ts",
+        optional_a=optional_a,
+        session=session,
+    )
+
+    assert session.requested_urls[0] == PLAYLIST_URL
+    assert "wsSecret" not in PLAYLIST_URL
+
+
+#: 填写了参数 B 时，「视频 URL」填的是下载链接，真实地址由模板推导。
+DOWNLOAD_LINK = "https://example.com/cover/example__1000001/example__1000001_sync.webp"
+BASE_B = "https://example"
+
+
+def _derived_session() -> tuple[str, str, FakeSession]:
+    """构造只认推导出的播放列表地址的假会话，返回（地址, 分片基址, 会话）。"""
+    derived = util.rebuild_url(DOWNLOAD_LINK, SECRET_A, base=BASE_B)
+    derived_base = derived.rsplit("/", 1)[0] + "/"
+    routes: dict[str, object] = {derived: FakeResponse(body=build_media_playlist(NAMES))}
+    routes.update(build_segment_routes(derived_base, NAMES))
+    return derived, derived_base, FakeSession(routes)
+
+
+def test_optional_b_derives_the_real_playlist_url_from_the_download_link(tmp_path, monkeypatch):
+    monkeypatch.setattr(util, "time", _FixedClock)
+    derived, derived_base, session = _derived_session()
+
+    result = downloader.download_hls_video(
+        DOWNLOAD_LINK,
+        tmp_path / "out.ts",
+        optional_a=SECRET_A,
+        optional_b=BASE_B,
+        session=session,
+    )
+
+    assert result.segment_count == 3
+    assert session.requested_urls[0] == derived
+    assert derived.startswith("https://example/mu/example__1000001/hls/1/index.m3u8?wsSecret=")
+    assert f"wsTime={int(FIXED_NOW) + util.CLIENT_WS_TTL}" in derived
+    # 原下载链接本身不会被请求；分片按推导出的地址相对解析。
+    assert DOWNLOAD_LINK not in session.requested_urls
+    assert sorted(session.requested_urls[1:]) == sorted(
+        f"{derived_base}{name}" for name in NAMES
+    )
+
+
+def test_optional_b_alone_is_ignored_and_warns(tmp_path, caplog):
+    session = make_session()
+
+    with caplog.at_level(logging.WARNING, logger="hls_downloader"):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            tmp_path / "out.ts",
+            optional_b=BASE_B,
+            session=session,
+        )
+
+    assert session.requested_urls[0] == PLAYLIST_URL
+    assert "没有参数 A" in caplog.text
+
+
+def test_invalid_optional_b_is_rejected_before_any_request(tmp_path):
+    session = make_session()
+
+    with pytest.raises(InvalidUrlError):
+        downloader.download_hls_video(
+            DOWNLOAD_LINK,
+            tmp_path / "out.ts",
+            optional_a=SECRET_A,
+            optional_b="ftp://example.com",
+            session=session,
+        )
+
+    assert session.requests == []
+
+
+def test_optional_a_key_never_leaks_into_requests_or_logs(tmp_path, monkeypatch):
+    monkeypatch.setattr(util, "time", _FixedClock)
+    _signed, session = _signed_playlist_session()
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    task_logger = logging.getLogger("hls_downloader.test.optional_a")
+    task_logger.handlers = [_Capture()]
+    task_logger.setLevel(logging.DEBUG)
+    task_logger.propagate = False
+
+    downloader.download_hls_video(
+        PLAYLIST_URL,
+        tmp_path / "out.ts",
+        optional_a=SECRET_A,
+        session=session,
+        logger=task_logger,
+    )
+
+    for url, kwargs in session.requests:
+        assert SECRET_A not in url
+        assert SECRET_A not in repr(kwargs)
+    assert [text for text in records if SECRET_A in text] == []
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +498,12 @@ def test_segment_failure_never_reports_success(tmp_path):
 
     with pytest.raises(SegmentDownloadError) as excinfo:
         downloader.download_hls_video(
-            PLAYLIST_URL, output, session=session, temp_dir=work, max_retries=1
+            PLAYLIST_URL,
+            output,
+            session=session,
+            temp_dir=work,
+            max_retries=1,
+            resume=False,
         )
 
     assert excinfo.value.segment_index == 3
@@ -371,6 +542,64 @@ def test_empty_segment_body_is_a_failure_not_a_success(tmp_path):
     with pytest.raises(SegmentDownloadError):
         downloader.download_hls_video(
             PLAYLIST_URL, output, session=session, max_retries=1
+        )
+
+    assert not output.exists()
+
+
+def test_default_retry_budget_survives_repeated_transient_breaks(tmp_path):
+    """默认重试次数要能吞下连续 4 次瞬断（第 5 次成功即任务成功）。"""
+    routes: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(body=build_media_playlist([NAMES[0]]))
+    }
+    routes[f"{BASE}{NAMES[0]}"] = [
+        FakeResponse(status_code=503),
+        FakeResponse(status_code=503),
+        FakeResponse(status_code=503),
+        FakeResponse(status_code=503),
+        FakeResponse(body=b"OK" * 10, headers={"Content-Length": "20"}),
+    ]
+
+    result = downloader.download_hls_video(
+        PLAYLIST_URL, tmp_path / "out.ts", session=FakeSession(routes)
+    )
+
+    assert result.segment_count == 1
+    assert (tmp_path / "out.ts").read_bytes() == b"OK" * 10
+
+
+def test_short_body_without_a_transport_error_is_retried(tmp_path):
+    """服务器少发字节且不报错时，不能把截断的分片当成完整分片。"""
+    routes: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(body=build_media_playlist([NAMES[0]]))
+    }
+    routes[f"{BASE}{NAMES[0]}"] = [
+        FakeResponse(body=b"OK" * 4, headers={"Content-Length": "20"}),
+        FakeResponse(body=b"OK" * 10, headers={"Content-Length": "20"}),
+    ]
+    session = FakeSession(routes)
+
+    result = downloader.download_hls_video(
+        PLAYLIST_URL, tmp_path / "out.ts", session=session, max_retries=1
+    )
+
+    assert (tmp_path / "out.ts").read_bytes() == b"OK" * 10
+    assert result.total_bytes == 20
+    assert len(session.requests) == 3  # 播放列表 + 2 次分片
+
+
+def test_persistently_short_body_never_reports_success(tmp_path):
+    routes: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(body=build_media_playlist([NAMES[0]]))
+    }
+    routes[f"{BASE}{NAMES[0]}"] = FakeResponse(
+        body=b"OK" * 4, headers={"Content-Length": "20"}
+    )
+    output = tmp_path / "out.ts"
+
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL, output, session=FakeSession(routes), max_retries=1
         )
 
     assert not output.exists()
@@ -419,6 +648,7 @@ def test_cancel_during_segment_download_cleans_up(tmp_path):
             session=session,
             cancel_event=cancel,
             temp_dir=work,
+            resume=False,  # 这个用例专门验证「关掉续传时会清理临时文件」
             progress_callback=reports.append,
         )
 
@@ -446,7 +676,11 @@ def test_cancel_between_segments_stops_remaining_downloads(tmp_path):
 
     with pytest.raises(DownloadCancelled):
         downloader.download_hls_video(
-            PLAYLIST_URL, tmp_path / "out.ts", session=session, cancel_event=cancel
+            PLAYLIST_URL,
+            tmp_path / "out.ts",
+            session=session,
+            cancel_event=cancel,
+            workers=1,  # 这个用例验证的是顺序下载时的取消语义
         )
 
     assert f"{BASE}{NAMES[1]}" not in session.requested_urls
@@ -548,6 +782,165 @@ def test_temp_files_are_cleaned_after_failure(tmp_path):
             PLAYLIST_URL, tmp_path / "out.ts", session=session, temp_dir=work
         )
 
+    assert list(work.iterdir()) == []
+
+
+def test_resume_skips_already_downloaded_segments(tmp_path):
+    """第一次在第 3 个分片失败，第二次应当只请求剩下的那一个。"""
+    work = tmp_path / "work"
+    output = tmp_path / "out.ts"
+
+    broken = make_session(**{})
+    broken.routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            output,
+            session=broken,
+            temp_dir=work,
+            max_retries=0,
+            workers=1,
+        )
+
+    assert not output.exists()
+    assert list(work.iterdir()), "续传时应保留临时分片目录"
+
+    retry_session = make_session()
+    reports = []
+    result = downloader.download_hls_video(
+        PLAYLIST_URL,
+        output,
+        session=retry_session,
+        temp_dir=work,
+        workers=1,
+        progress_callback=reports.append,
+    )
+
+    assert retry_session.requested_urls[1:] == [f"{BASE}{NAMES[2]}"]
+    expected = b"".join(retry_session.routes[f"{BASE}{name}"].content for name in NAMES)
+    assert output.read_bytes() == expected
+    assert result.segment_count == 3
+    # 跳过的分片也要计入进度，否则进度条永远到不了 100%。
+    assert reports[-1].percent == pytest.approx(100.0)
+    assert list(work.iterdir()) == [], "成功后应当清理续传目录"
+
+
+def test_resume_redownloads_a_truncated_leftover(tmp_path):
+    """上次被强杀留下的半截分片（大小对不上）必须重新下载。"""
+    work = tmp_path / "work"
+    output = tmp_path / "out.ts"
+
+    broken = make_session()
+    broken.routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL, output, session=broken, temp_dir=work, max_retries=0, workers=1
+        )
+
+    temp_dir = next(work.iterdir())
+    victim = temp_dir / "000001.ts"
+    victim.write_bytes(victim.read_bytes()[:4])
+
+    retry_session = make_session()
+    downloader.download_hls_video(
+        PLAYLIST_URL, output, session=retry_session, temp_dir=work, workers=1
+    )
+
+    assert f"{BASE}{NAMES[1]}" in retry_session.requested_urls, "半截分片没有被重新下载"
+    expected = b"".join(retry_session.routes[f"{BASE}{name}"].content for name in NAMES)
+    assert output.read_bytes() == expected
+
+
+def test_resume_discards_segments_when_the_playlist_changed(tmp_path):
+    """片源换了（播放列表内容不同）时不能复用旧分片。"""
+    work = tmp_path / "work"
+    output = tmp_path / "out.ts"
+
+    broken = make_session()
+    broken.routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL, output, session=broken, temp_dir=work, max_retries=0, workers=1
+        )
+
+    # 同一个地址、同一批分片名，但播放列表内容变了（时长不同）。
+    changed: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(
+            body=build_media_playlist(NAMES, durations=[4.0, 4.0, 9.0])
+        )
+    }
+    changed.update(build_segment_routes(BASE, NAMES))
+    retry_session = FakeSession(changed)
+
+    downloader.download_hls_video(
+        PLAYLIST_URL, output, session=retry_session, temp_dir=work, workers=1
+    )
+
+    assert sorted(retry_session.requested_urls[1:]) == sorted(
+        f"{BASE}{name}" for name in NAMES
+    ), "播放列表变了却复用了旧分片"
+
+
+def test_resume_disabled_always_starts_from_scratch(tmp_path):
+    work = tmp_path / "work"
+    output = tmp_path / "out.ts"
+
+    broken = make_session()
+    broken.routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            output,
+            session=broken,
+            temp_dir=work,
+            max_retries=0,
+            workers=1,
+            resume=False,
+        )
+
+    assert list(work.iterdir()) == [], "关掉续传后失败时应当清理临时文件"
+
+
+def test_concurrent_downloads_keep_playlist_order(tmp_path):
+    """多路并发时，合并顺序仍必须严格按播放列表来。"""
+    names = [f"s{index}.ts" for index in range(12)]
+    routes: dict[str, object] = {PLAYLIST_URL: FakeResponse(body=build_media_playlist(names))}
+    for index, name in enumerate(names):
+        routes[f"{BASE}{name}"] = FakeResponse(body=f"[{index:02d}]".encode())
+
+    session = FakeSession(routes)
+    result = downloader.download_hls_video(
+        PLAYLIST_URL, tmp_path / "out.ts", session=session, workers=6
+    )
+
+    expected = b"".join(f"[{index:02d}]".encode() for index in range(12))
+    assert (tmp_path / "out.ts").read_bytes() == expected
+    assert result.segment_count == 12
+
+
+def test_concurrent_failure_never_reports_success(tmp_path):
+    names = [f"s{index}.ts" for index in range(8)]
+    routes: dict[str, object] = {PLAYLIST_URL: FakeResponse(body=build_media_playlist(names))}
+    for index, name in enumerate(names):
+        routes[f"{BASE}{name}"] = FakeResponse(body=f"[{index:02d}]".encode())
+    routes[f"{BASE}s3.ts"] = FakeResponse(status_code=500)
+
+    work = tmp_path / "work"
+    output = tmp_path / "out.ts"
+
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            output,
+            session=FakeSession(routes),
+            temp_dir=work,
+            workers=4,
+            max_retries=0,
+            resume=False,
+        )
+
+    assert not output.exists()
     assert list(work.iterdir()) == []
 
 
@@ -752,6 +1145,23 @@ def test_aes128_playlist_is_downloaded_and_decrypted(tmp_path):
 
     assert (tmp_path / "out.ts").read_bytes() == b"".join(plains)
     assert result.segment_count == 3
+
+
+def test_short_ciphertext_is_retried_instead_of_decrypted(tmp_path):
+    """密文被截断时不能硬解：长度对不上就该重试，而不是产出错误内容。"""
+    session, plains = _encrypted_session(NAMES[:1])
+    route = f"{BASE}{NAMES[0]}"
+    cipher = session.routes[route].content
+    session.routes[route] = [
+        FakeResponse(body=cipher[:-16], headers={"Content-Length": str(len(cipher))}),
+        FakeResponse(body=cipher, headers={"Content-Length": str(len(cipher))}),
+    ]
+
+    downloader.download_hls_video(
+        PLAYLIST_URL, tmp_path / "out.ts", session=session, max_retries=1
+    )
+
+    assert (tmp_path / "out.ts").read_bytes() == b"".join(plains)
 
 
 def test_key_is_requested_only_once_for_the_whole_playlist(tmp_path):

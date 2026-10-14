@@ -120,6 +120,7 @@ class Fonts:
     small: ctk.CTkFont
     hint: ctk.CTkFont
     metric: ctk.CTkFont
+    display: ctk.CTkFont
     log: ctk.CTkFont
 
 
@@ -143,5 +144,6 @@ def create_fonts() -> Fonts:
         small=font(12),
         hint=font(11),
         metric=font(15, "bold"),
+        display=font(26, "bold"),
         log=font(12),
     )
