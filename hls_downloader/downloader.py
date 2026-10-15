@@ -83,7 +83,7 @@ PROGRESS_EMIT_INTERVAL_SECONDS = 0.1
 #: 失败，进度条不该先走满再报错。
 MAX_PERCENT_BEFORE_COMPLETION = 99.0
 
-USER_AGENT = "KakaCat-HLSDownloader/1.0"
+USER_AGENT = "KakaCat/2.0"
 
 
 def create_session(*, workers: int = DEFAULT_WORKERS) -> requests.Session:

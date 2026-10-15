@@ -1,4 +1,4 @@
-"""HLS 视频下载器核心包。
+"""KakaCat（HLS 视频下载器）的核心包。
 
 本包只包含与界面无关的下载逻辑，可以被 GUI、脚本或自动化测试独立调用：
 
@@ -41,7 +41,7 @@ from .models import (
 from .playlist import parse_playlist
 from .url_utils import redact_url, resolve_url, validate_http_url
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "__version__",

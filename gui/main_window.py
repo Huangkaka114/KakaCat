@@ -67,6 +67,9 @@ from .components import (
 )
 from .theme import Fonts
 
+#: 软件名。窗口标题、界面标题栏、日志抬头都用它——只此一处，改名不用满仓库找。
+APP_NAME = "KakaCat"
+
 #: 消息队列轮询间隔（毫秒）
 POLL_INTERVAL_MS = 100
 
@@ -206,7 +209,7 @@ class MainWindow(ctk.CTk):
         #: 上次选中的倍速；重新起播放时沿用它
         self._playback_speed = 1.0
 
-        self.title("HLS 视频下载器")
+        self.title(APP_NAME)
         self.configure(fg_color=theme.BG_APP)
         # 最小尺寸保持较小，小屏设备上由自适应布局与滚动区域兜底
         self.minsize(720, 540)
@@ -219,7 +222,7 @@ class MainWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._schedule_poll()
 
-        self.log_panel.append(f"HLS 视频下载器 v{__version__} 已启动。", "success")
+        self.log_panel.append(f"{APP_NAME} v{__version__} 已启动。", "success")
         self.log_panel.append(
             "请确认你拥有所下载视频的访问与下载权限。",
             "warn",
@@ -289,7 +292,7 @@ class MainWindow(ctk.CTk):
         ).grid(row=0, column=0, rowspan=2, padx=(theme.SPACE_LG, theme.SPACE_MD), pady=theme.SPACE_MD)
 
         ctk.CTkLabel(
-            header, text="HLS 视频下载器", font=self._fonts.title, text_color=theme.TEXT, anchor="w"
+            header, text=APP_NAME, font=self._fonts.title, text_color=theme.TEXT, anchor="w"
         ).grid(row=0, column=1, sticky="sw", pady=(theme.SPACE_MD, 0))
 
         ctk.CTkLabel(

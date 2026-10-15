@@ -79,7 +79,7 @@ ctk.set_default_color_theme("blue")
 包含：
 
 - 应用图标。
-- 应用名称：HLS 视频下载器。
+- 应用名称：KakaCat。
 - 简短说明：输入 M3U8 链接，下载并合并视频。
 - 可选的主题状态展示。
 

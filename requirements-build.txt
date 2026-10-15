@@ -1,0 +1,4 @@
+# 打包/构建依赖
+# 只有要打 exe 或安装程序时才需要，跑程序和跑测试都不需要它们。
+-r requirements.txt
+pyinstaller>=6.0.0

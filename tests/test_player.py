@@ -103,6 +103,9 @@ class _WhichStub:
 
 
 def test_find_ffplay_looks_it_up_on_path(monkeypatch):
+    # 必须屏蔽"随包分发"那一档：开发机上只要 bin/ 里有 ffplay.exe，它就会优先
+    # 命中，这两个用例就不再是在测 PATH 了
+    monkeypatch.setattr(player, "find_bundled_tool", lambda name: None)
     stub = _WhichStub(FFPLAY)
     monkeypatch.setattr(player, "shutil", stub)
 
@@ -111,9 +114,18 @@ def test_find_ffplay_looks_it_up_on_path(monkeypatch):
 
 
 def test_find_ffplay_returns_none_when_missing(monkeypatch):
+    monkeypatch.setattr(player, "find_bundled_tool", lambda name: None)
     monkeypatch.setattr(player, "shutil", _WhichStub(None))
 
     assert find_ffplay() is None
+
+
+def test_find_ffplay_prefers_a_version_shipped_with_the_app(monkeypatch, tmp_path):
+    bundled = tmp_path / "ffplay.exe"
+    monkeypatch.setattr(player, "find_bundled_tool", lambda name: bundled)
+    monkeypatch.setattr(player, "shutil", _WhichStub(FFPLAY))
+
+    assert find_ffplay() == str(bundled)
 
 
 # --------------------------------------------------------------------------

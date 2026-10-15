@@ -34,6 +34,13 @@ _hls_tmp*/
 hls_resume_*/
 hls_segments_*/
 
+# ---- 打包产物 ----
+# exe、安装程序与构建中间产物（build/、dist/ 已在上面忽略）
+# bin/ 是随包分发的第三方二进制（ffmpeg / mpv），几十 MB 且各有自己的许可，
+# 不入库；要随包分发就用 packaging/build.py --bundle-tools 现拷
+/bin/
+packaging/resources/_preview.png
+
 # ---- 程序自己的运行数据 ----
 # 便携模式下程序会在自己目录里建 data/（临时文件、将来的日志与配置），
 # 那是本机运行产物，不该入库

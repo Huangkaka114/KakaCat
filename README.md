@@ -1,7 +1,7 @@
-# HLS 视频下载器
+# KakaCat
 
-一个基于 **CustomTkinter** 的现代化 Windows 桌面应用：输入 M3U8 播放列表链接，
-程序获取并解析播放列表、并发下载视频分片，最后合并成完整的视频文件。
+一个基于 **CustomTkinter** 的现代化 HLS 视频下载器（Windows 桌面应用）：输入 M3U8
+播放列表链接，程序获取并解析播放列表、并发下载视频分片，最后合并成完整的视频文件。
 
 蓝黑科技风深色主题、实时进度、可滚动运行日志，所有文字配色满足 WCAG AA；
 下载核心是独立可测试的纯 Python 函数，不依赖任何界面框架。
@@ -222,9 +222,10 @@ python main.py
 
 ```
 KakaCat/
-├── main.py                     # 应用启动入口
+├── main.py                     # 应用启动入口（--check 只报告运行环境）
 ├── requirements.txt            # 运行依赖
 ├── requirements-dev.txt        # 测试依赖
+├── requirements-build.txt      # 打包依赖（只在打 exe / 安装程序时需要）
 ├── pytest.ini                  # 测试配置（含 integration 标记）
 ├── README.md
 ├── hls_downloader/             # 下载核心（不含任何 GUI 代码）
@@ -256,6 +257,15 @@ KakaCat/
     ├── test_interfaces.py
     ├── test_gui_helpers.py
     └── test_gui_integration.py # 需要图形环境，否则自动跳过
+├── packaging/                  # 打包配置（见第十四节）
+│   ├── build.py                # 一条命令打包 / 生成安装程序
+│   ├── KakaCat.spec            # PyInstaller 配置
+│   ├── KakaCat.iss             # Inno Setup 安装程序脚本
+│   ├── make_icon.py            # 重新生成应用图标
+│   ├── languages/              # 安装程序的中文语言文件
+│   └── resources/KakaCat.ico   # 应用图标
+├── bin/                        # 随包分发的第三方工具（不入库，用时现拷）
+├── dist/  build/               # 打包产物与中间文件（不入库）
 ```
 
 ## 十、作为库调用
@@ -413,39 +423,70 @@ python -m pytest -m integration
 真正的坑只有两个：customtkinter 的主题 JSON 必须一起收进去，以及别让程序往
 安装目录之外乱写。
 
-### 用 PyInstaller 打包
+打包脚本与配置都在 `packaging/` 下，已经准备好，直接跑就行。
+
+### 一条命令打包
 
 ```bash
-pip install pyinstaller
-pyinstaller --noconsole --name KakaCat --collect-all customtkinter main.py
+pip install -r requirements-build.txt      # 只有打包才需要 PyInstaller
+python packaging/build.py                  # → dist/KakaCat/KakaCat.exe
+python packaging/build.py --bundle-tools   # 顺手把 ffmpeg/mpv 打进包里
 ```
 
-`--collect-all customtkinter` **不能省**：customtkinter 读取主题与字体的 JSON 时
-用的是自己包目录里的相对路径，不一起打包的话，打出来的 exe 一启动就报
-`FileNotFoundError: ... theme ... json`，界面根本出不来。
+产物是**目录**（onedir）而不是单文件：程序要在自己目录下找随包分发的 `bin/`
+工具，onedir 的结构天然就是这个形状；单文件每次启动都要先解包到临时目录，
+又慢又容易让人误以为程序在往系统盘写东西。
+
+`packaging/build.py` 干的事：从 `hls_downloader.__version__` 读版本号（唯一来源）、
+生成 Windows 版本资源、调 PyInstaller、最后**跑一遍打出来的 exe 自检**并把结果
+打出来。想直接敲 pyinstaller 的话请用 `packaging/KakaCat.spec`，别手敲命令行——
+版本资源、图标、随包工具都在 spec 里接好了。
+
+> `--collect-all customtkinter`（spec 里已经写了）**不能省**：customtkinter 读取
+> 主题与字体的 JSON 用的是自己包目录里的相对路径，不一起打包的话，exe 一启动就报
+> `FileNotFoundError: ... theme ... json`，界面根本出不来。
+
+### 生成安装程序
+
+```bash
+winget install JRSoftware.InnoSetup        # 一次就够
+python packaging/build.py --installer      # → dist/KakaCat-<版本>-setup.exe
+```
+
+安装程序脚本是 `packaging/KakaCat.iss`（Inno Setup 6/7）。几个刻意的选择：
+
+- **按用户安装**（`PrivilegesRequired=lowest`，装到
+  `%LOCALAPPDATA%\Programs\KakaCat`），**不弹 UAC**。这也是程序能正常工作的前提：
+  便携模式要往自己目录下的 `data\` 写运行数据，装进 `Program Files` 会因为只读而
+  退回 `%LOCALAPPDATA%`。
+- 中文向导：Inno Setup 官方包**不带简体中文**（只有日韩泰等），所以
+  `packaging/languages/ChineseSimplified.isl` 是从 Inno Setup 官方仓库取来放进
+  仓库的，打包不依赖网络。它要求 Inno Setup 6.5.0+。
+- 卸载**明确清干净**，连 `data\` 一起删，不留说不清来历的空目录。
 
 ### 把 ffmpeg / mpv 随包分发（可选，但推荐）
 
-想在目标机器上不额外装东西，就把它们放进程序目录下的 `bin\`：
-
-```
-KakaCat/
-├── KakaCat.exe
-├── bin/
-│   ├── ffmpeg.exe    # 输出 .mp4 用（只做 -c copy，不重新编码）
-│   └── mpv.exe       # 进度条与倍速用
-└── data/             # 运行数据（便携模式自动创建）
-```
-
-onefile 模式可以把它们塞进包里：
-
 ```bash
-pyinstaller --noconsole --name KakaCat --collect-all customtkinter \
-  --add-binary "bin/ffmpeg.exe;bin" --add-binary "bin/mpv.exe;bin" main.py
+python packaging/build.py --bundle-tools
 ```
 
-查找外部工具的顺序是 **随包分发的（`bin\` 与 `_MEIPASS`）→ `PATH` → 常见安装位置**，
-所以随包放在 `bin\` 里的那份会被优先使用。
+它会把能在本机找到的 `ffmpeg` / `ffplay` / `mpv` 拷进仓库的 `bin\`，再一起打进
+包里（打出来的样子见下）。这样目标机器上什么都不用装。`bin\` **不入库**——那是
+几十 MB 的第三方二进制、各有各的许可（见下面的许可提醒），要用时现拷。
+
+```
+dist/KakaCat/
+├── KakaCat.exe
+├── _internal/
+│   └── bin/                 # ← 随包工具在这里（PyInstaller 6 把 onedir 的东西都收进 _internal）
+│       ├── ffmpeg.exe       # 输出 .mp4 用（只做 -c copy，不重新编码）
+│       ├── ffplay.exe       # 没有 mpv 时的在线播放兜底
+│       └── mpv.exe          # 进度条与倍速用
+└── data/                    # 运行数据，首次运行或 --check 时自动创建
+```
+
+查找外部工具的顺序是 **随包分发的 → `PATH` → 常见安装位置**，所以随包的那份会被
+优先使用。
 
 ### 「不侵入安装目录外」具体指什么
 
@@ -467,7 +508,16 @@ FFmpeg 与 mpv 都是第三方程序，各自有许可（LGPL/GPL）。**随包�
 
 ### 打包后自检
 
-1. 启动 exe，右侧「运行环境」应显示 mpv / ffplay / FFmpeg 的检测结果；
+打包脚本自己就会跑第 1 步。手动排查时用这个开关，它不开界面、只报告环境：
+
+```bash
+dist\KakaCat\KakaCat.exe --check
+```
+
+在源码里同样能用（`python main.py --check`）。打包后的程序是窗口程序、**没有控制台**，
+`print` 出去没人看得见，所以它会把同一份报告另写到 `data\diagnostics.txt`。
+
+1. `--check` 应显示 mpv / ffplay / ffmpeg 都被找到，随包分发的会标注「（随包分发）」；
 2. 下载一个小片源，确认默认文件名是 `.mp4`、产物能双击播放；
 3. 检查程序目录：只应多出 `data\`（如果用了便携模式），不应出现分片或临时文件；
 4. 把整个程序目录拷到另一台没装 ffmpeg/mpv 的机器上，用随包的 `bin\` 再走一遍
