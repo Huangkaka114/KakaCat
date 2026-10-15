@@ -100,6 +100,19 @@ def test_redact_url_keeps_host_and_filename():
     assert redact_url("https://cdn.test/index.m3u8") == "https://cdn.test/index.m3u8"
 
 
+def test_redact_url_drops_credentials_in_the_userinfo():
+    """有的服务把令牌放在 ``user:password@`` 里，那部分不能进日志。"""
+    redacted = redact_url("https://token:s3cret@cdn.test/video/index.m3u8?wsSecret=x")
+
+    assert "s3cret" not in redacted
+    assert "token" not in redacted
+    assert redacted.startswith("https://cdn.test/")
+
+
+def test_redact_url_keeps_the_port_when_dropping_credentials():
+    assert redact_url("https://u:p@cdn.test:8443/a/b.m3u8") == "https://cdn.test:8443/…/b.m3u8"
+
+
 def test_redact_url_handles_unparseable_input():
     assert redact_url("") == "<空>"
     assert "无效" in redact_url("not-a-url")

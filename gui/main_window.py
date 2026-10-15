@@ -27,7 +27,12 @@ from urllib.parse import urlsplit
 import customtkinter as ctk
 
 from hls_downloader import __version__
-from hls_downloader.downloader import DEFAULT_WORKERS, MAX_WORKERS, download_hls_video
+from hls_downloader.downloader import (
+    DEFAULT_WORKERS,
+    MAX_WORKERS,
+    download_hls_video,
+    prepare_playlist_url,
+)
 from hls_downloader.merger import find_ffmpeg
 from hls_downloader.models import (
     DownloadCancelled,
@@ -37,6 +42,15 @@ from hls_downloader.models import (
     ProgressReport,
     TaskStage,
 )
+from hls_downloader.player import (
+    PlayerError,
+    PlayerHandle,
+    find_ffplay,
+    find_mpv,
+    launch_playback,
+    stop_playback,
+)
+from hls_downloader.playback import PlaybackInfo, inspect_playlist
 from hls_downloader.url_utils import validate_http_url
 
 from . import theme
@@ -44,10 +58,12 @@ from .components import (
     Card,
     LabeledEntry,
     LogPanel,
+    PlaybackPanel,
     SectionTitle,
     StatusPanel,
     format_bytes,
     format_elapsed,
+    format_playback_summary,
 )
 from .theme import Fonts
 
@@ -63,6 +79,18 @@ MSG_PROGRESS = "progress"
 MSG_DONE = "done"
 MSG_FAILED = "failed"
 MSG_CANCELLED = "cancelled"
+MSG_PLAYBACK_READY = "playback_ready"
+MSG_PLAYBACK_FAILED = "playback_failed"
+MSG_PLAYBACK_CANCELLED = "playback_cancelled"
+
+#: 轮询播放器进程是否已退出的间隔（毫秒）。播放器是独立进程，只有靠轮询
+#: 才能知道用户是不是自己把窗口关掉了。
+PLAYBACK_POLL_INTERVAL_MS = 500
+
+#: 播放器在这个时间内退出，就认为它根本没播起来（秒）。ffplay 以 0 退出也可能是
+#: 失败，因此除了返回码，还要看它活了多久、有没有报错。
+PLAYBACK_STARTUP_GRACE_SECONDS = 3.0
+
 
 def _stretch_to_viewport(card) -> None:
     """让可滚动区域里的卡片横向铺满视口。
@@ -100,8 +128,23 @@ def sanitize_filename(name: str, fallback: str = "video") -> str:
     return cleaned[:120]
 
 
-def default_filename_from_url(url: str, suffix: str = ".ts") -> str:
-    """根据播放列表地址给出一个合理的默认文件名。"""
+def default_output_suffix() -> str:
+    """默认的输出容器扩展名。
+
+    优先 ``.mp4``：双击就能播、兼容性最好。但它需要 FFmpeg 把 TS 重新封装
+    （``-c copy``，不重新编码），所以**没检测到 FFmpeg 时退回 ``.ts``**——
+    否则默认值一上来就是个注定失败的选择。
+    """
+    return ".mp4" if find_ffmpeg() is not None else ".ts"
+
+
+def default_filename_from_url(url: str, suffix: str | None = None) -> str:
+    """根据播放列表地址给出一个合理的默认文件名。
+
+    ``suffix`` 留空时按 :func:`default_output_suffix` 决定（有 FFmpeg 用
+    ``.mp4``，没有用 ``.ts``）。
+    """
+    suffix = suffix or default_output_suffix()
     try:
         path = urlsplit(url).path
     except ValueError:
@@ -149,9 +192,19 @@ class MainWindow(ctk.CTk):
         self._cancel_event: threading.Event | None = None
         self._closing = False
         self._poll_after_id: str | None = None
+        #: 关闭续传时，本次下载的临时分片目录（建在输出目录下，任务结束即删）
         self._temp_root: Path | None = None
         self._filename_customized = False
         self._wide = True
+        # 在线播放的状态与下载完全独立：在线播放不占用下载的按钮状态机，
+        # 下载在跑的时候也可以在线播放。
+        self._playback_worker: threading.Thread | None = None
+        self._playback_cancel: threading.Event | None = None
+        self._playback_process: PlayerHandle | None = None
+        self._playback_poll_id: str | None = None
+        self._playback_generation = 0
+        #: 上次选中的倍速；重新起播放时沿用它
+        self._playback_speed = 1.0
 
         self.title("HLS 视频下载器")
         self.configure(fg_color=theme.BG_APP)
@@ -161,10 +214,6 @@ class MainWindow(ctk.CTk):
         self._build_ui()
         self._apply_responsive_layout(wide=True)
         self._center_window()
-
-        # 窗口自己持有临时根目录：任务线程是守护线程，被强杀时核心里的
-        # 清理来不及执行，关闭窗口时由这里兜底删除，不把分片留在临时目录。
-        self._temp_root = Path(tempfile.mkdtemp(prefix="hls_downloader_"))
 
         self.bind("<Configure>", self._on_configure)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -179,6 +228,17 @@ class MainWindow(ctk.CTk):
             self.log_panel.append(
                 "未检测到 FFmpeg：输出 .ts 文件不受影响；如需封装为 MP4，请安装 FFmpeg 并加入 PATH。",
                 "warn",
+            )
+        if find_mpv() is None and find_ffplay() is None:
+            self.log_panel.append(
+                "未检测到 mpv，也没有 ffplay：在线播放不可用（下载不受影响）。"
+                "装 mpv 可获得进度条与倍速；装 FFmpeg 可以得到 ffplay。",
+                "warn",
+            )
+        elif find_mpv() is None:
+            self.log_panel.append(
+                "未检测到 mpv：在线播放会退回 ffplay，但进度条与倍速不可用。",
+                "info",
             )
 
     # ------------------------------------------------------------------
@@ -298,6 +358,19 @@ class MainWindow(ctk.CTk):
             scrollbar_button_hover_color=theme.BORDER_STRONG,
         )
         self._build_info_panel(self._right_column)
+
+        # 在线播放放在右栏最下面：它是与下载并列的独立入口，不占用左栏的
+        # 下载操作条，也不参与下载的状态机。
+        self.playback_panel = PlaybackPanel(
+            self._right_column,
+            self._fonts,
+            on_play=self._on_playback,
+            on_stop=self._on_playback_stop,
+            on_copy=self._on_copy_playlist_url,
+            on_speed=self._on_playback_speed,
+        )
+        self.playback_panel.grid(row=1, column=0, sticky="ew", pady=(theme.SPACE_MD, 0))
+        _stretch_to_viewport(self.playback_panel)
 
     def _build_settings_card(self, parent) -> None:
         card = Card(parent)
@@ -491,7 +564,8 @@ class MainWindow(ctk.CTk):
             panel,
             text=(
                 "HLS 点播（VOD）媒体播放列表，支持 TS 与 fMP4/CMAF 分片，并支持整段 "
-                "AES-128 加密；链接只接受 HTTP/HTTPS。"
+                "AES-128 加密；链接只接受 HTTP/HTTPS。\n"
+                "在线播放比下载宽松：主播放列表与直播列表也可以交给播放器试播。"
             ),
             font=self._fonts.small,
             text_color=theme.TEXT_SECONDARY,
@@ -538,14 +612,40 @@ class MainWindow(ctk.CTk):
             wraplength=380,
         ).grid(row=5, column=0, sticky="ew", padx=theme.SPACE_LG)
 
+        mpv = find_mpv()
+        ctk.CTkLabel(
+            panel,
+            text=(
+                f"mpv：{'已检测到，在线播放支持进度条与倍速。' if mpv else '未检测到，进度条与倍速不可用。'}"
+            ),
+            font=self._fonts.small,
+            text_color=theme.SUCCESS if mpv else theme.WARNING,
+            justify="left",
+            anchor="w",
+            wraplength=380,
+        ).grid(row=6, column=0, sticky="ew", padx=theme.SPACE_LG)
+
+        ffplay = find_ffplay()
+        ctk.CTkLabel(
+            panel,
+            text=(
+                f"ffplay：{'已检测到，可在线播放。' if ffplay else '未检测到。'}"
+            ),
+            font=self._fonts.small,
+            text_color=theme.SUCCESS if ffplay else theme.TEXT_DIM,
+            justify="left",
+            anchor="w",
+            wraplength=380,
+        ).grid(row=7, column=0, sticky="ew", padx=theme.SPACE_LG)
+
         SectionTitle(panel, "快捷操作", self._fonts).grid(
-            row=6, column=0, sticky="w",
+            row=8, column=0, sticky="w",
             padx=theme.SPACE_LG, pady=(theme.SPACE_LG, theme.SPACE_SM),
         )
 
         shortcuts = ctk.CTkFrame(panel, fg_color="transparent")
         shortcuts.grid(
-            row=7, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG)
+            row=9, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG)
         )
         shortcuts.columnconfigure(0, weight=1, uniform="shortcut")
         shortcuts.columnconfigure(1, weight=1, uniform="shortcut")
@@ -637,7 +737,7 @@ class MainWindow(ctk.CTk):
             return
         url = self.url_entry.get().strip()
         if url:
-            self.filename_entry.set(default_filename_from_url(url))
+            self.filename_entry.set(default_filename_from_url(url, default_output_suffix()))
 
     def _on_filename_edited(self, _event=None) -> None:
         self._filename_customized = True
@@ -713,6 +813,22 @@ class MainWindow(ctk.CTk):
             self.workers_var.set(str(DEFAULT_WORKERS))
         workers = min(max(1, workers), MAX_WORKERS)
 
+        # 关闭续传时窗口要自己持有临时目录：任务线程是守护线程，被强杀时核心
+        # 里的清理来不及执行，得由窗口兜底删除。它建在**输出目录**下而不是
+        # 系统临时目录——分片可能有几个 GB，写进系统盘会把它撑爆；建在输出目录
+        # 里也保证不会往安装目录之类的地方乱写。
+        self._cleanup_temp_root()
+        if not resume:
+            try:
+                self._temp_root = Path(
+                    tempfile.mkdtemp(prefix=".hls_session_", dir=str(output_path.parent))
+                )
+            except OSError as exc:
+                messagebox.showerror(
+                    "无法创建临时目录", f"{output_path.parent}\n{exc}", parent=self
+                )
+                return
+
         self._cancel_event = threading.Event()
         self.status_panel.reset()
         self.log_panel.append(
@@ -763,7 +879,7 @@ class MainWindow(ctk.CTk):
 
         filename = sanitize_filename(self.filename_entry.get(), fallback="video")
         if not Path(filename).suffix:
-            filename += ".ts"
+            filename += default_output_suffix()
         self.filename_entry.set(filename)
 
         return dir_path / filename
@@ -775,6 +891,354 @@ class MainWindow(ctk.CTk):
         self.cancel_button.configure(state="disabled", text="正在取消…")
         self.status_panel.show_stage(TaskStage.CANCELLING)
         self.log_panel.append("已发送取消请求，正在停止任务…", "warn")
+
+    # ------------------------------------------------------------------
+    # 在线播放
+    # ------------------------------------------------------------------
+
+    def _on_playback(self) -> None:
+        """启动在线播放：只播放，不下载。
+
+        在线播放与下载互不阻塞——它有自己的线程、取消信号和子进程，不参与
+        :meth:`_set_running` 的按钮状态机，因此下载进行中照样可以在线播放。
+        """
+        if self._is_playing():
+            self.log_panel.append("播放器已在播放，请先停止在线播放。", "warn")
+            return
+
+        url = self.url_entry.get().strip()
+        try:
+            validate_http_url(url)
+        except InvalidUrlError as exc:
+            self.log_panel.append(f"链接无效：{exc.message}", "error")
+            messagebox.showwarning("链接无效", exc.message, parent=self)
+            self.url_entry.focus_entry()
+            return
+
+        # 先做一次代价极低的可用性检查，省掉一次注定失败的请求
+        if find_mpv() is None and find_ffplay() is None:
+            message = (
+                "未检测到可用的播放器，无法在线播放。请安装 mpv（有进度条与倍速），"
+                "或安装 FFmpeg（其中带 ffplay，只提供基本播放）。"
+            )
+            self.playback_panel.show_failed(message)
+            self.log_panel.append(message, "error")
+            messagebox.showerror("无法在线播放", message, parent=self)
+            return
+
+        optional_a = self.optional_a_entry.get().strip() or None
+        optional_b = self.optional_b_entry.get().strip() or None
+
+        # 每次在线播放都有一个代号：上一轮迟到的消息据此丢弃，避免"停止后立刻
+        # 重播"时旧消息把新状态覆盖掉。
+        self._playback_generation += 1
+        generation = self._playback_generation
+        self._playback_cancel = threading.Event()
+        # 事件对象作为参数传给线程，不要让它回头去读 self._playback_cancel：
+        # 属性可能已被下一轮播放（或停止）换掉，那样这次请求就取消不掉了。
+        cancel = self._playback_cancel
+        self.playback_panel.show_inspecting()
+        self.log_panel.append("正在获取播放列表用于在线播放（只取列表，不下载分片）…", "info")
+
+        try:
+            self._playback_worker = threading.Thread(
+                target=self._playback_worker_main,
+                args=(url, optional_a, optional_b, generation, cancel),
+                name="hls-playback",
+                daemon=True,
+            )
+            self._playback_worker.start()
+        except Exception as exc:  # noqa: BLE001 - 线程创建失败不能锁死在线播放
+            self._playback_worker = None
+            self._playback_cancel = None
+            message = f"无法启动在线播放：{exc}"
+            self.playback_panel.show_failed(message)
+            self.log_panel.append(message, "error")
+
+    def _on_playback_stop(self) -> None:
+        """停止播放：取消预检，或结束播放器进程。"""
+        if self._playback_cancel is not None:
+            self._playback_cancel.set()
+        self._playback_generation += 1  # 让在途的在线播放消息作废
+
+        if self._playback_poll_id is not None:
+            try:
+                self.after_cancel(self._playback_poll_id)
+            except Exception:  # pragma: no cover - 解释器正在退出
+                pass
+            self._playback_poll_id = None
+
+        process = self._playback_process
+        self._playback_process = None
+        self._playback_worker = None
+
+        if process is not None and process.poll() is None:
+            # 结束进程可能要先 terminate 再 kill，放到子线程里做，
+            # 免得点一下「停止播放」界面就卡住。
+            threading.Thread(
+                target=stop_playback,
+                args=(process,),
+                name="hls-playback-stop",
+                daemon=True,
+            ).start()
+            self.log_panel.append("已停止播放。", "info")
+        else:
+            self.log_panel.append("已取消在线播放。", "info")
+
+        self.playback_panel.show_stopped()
+
+    def _on_copy_playlist_url(self) -> None:
+        """把按可选参数签名后的播放列表地址复制到剪贴板。
+
+        给「在手机上播」用：算出来的地址是**自包含**的（签名就在 query 里），
+        有效期内任何支持 HLS 的播放器都能直接打开，不需要装这个程序。
+        """
+        raw = self.url_entry.get().strip()
+        optional_a = self.optional_a_entry.get().strip() or None
+        optional_b = self.optional_b_entry.get().strip() or None
+
+        try:
+            # 与下载、在线播放共用同一个入口：三者算出的地址必然一致
+            signed = prepare_playlist_url(raw, optional_a, optional_b)
+        except HLSDownloaderError as exc:
+            self.log_panel.append(f"无法生成播放地址：{exc.message}", "error")
+            messagebox.showwarning("无法生成播放地址", exc.message, parent=self)
+            return
+
+        if optional_b and not optional_a:
+            self.log_panel.append(
+                "只填写了参数 B（基础地址），缺少参数 A（密钥），复制的是原始链接。",
+                "warn",
+            )
+
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(signed)
+            # Tk 的剪贴板是延迟提交的，不 update 的话程序一退出内容就没了
+            self.update()
+        except Exception as exc:  # noqa: BLE001 - 剪贴板被别的程序占着是常事
+            self.log_panel.append(f"复制失败：{exc.__class__.__name__}：{exc}", "error")
+            return
+
+        self.log_panel.append(
+            "已复制播放地址到剪贴板（含签名，2 小时内有效）。"
+            "可直接粘到手机上的 VLC / mpv 等播放器播放；请勿外传。",
+            "success",
+        )
+
+    def _on_playback_speed(self, speed: float) -> None:
+        """面板上的倍速按钮：实时改，不用重启播放器。
+
+        mpv 的窗口里**没有**倍速控件（它的 osc.lua 编译在 exe 里，只提供可拖的
+        进度条），所以这个按钮只能由我们给。进度条则相反——留在窗口里。
+        """
+        self._playback_speed = speed
+        process = self._playback_process
+        if process is None or not process.supports_control:
+            return
+        if process.set_speed(speed):
+            self.log_panel.append(f"播放速度已设为 {speed:g}×。", "info")
+        else:
+            self.log_panel.append("设置倍速失败：播放器没有响应。", "warn")
+
+    def _is_playing(self) -> bool:
+        """在线播放是否正在进行（预检中或播放中）。"""
+        process = self._playback_process
+        if process is not None and process.poll() is None:
+            return True
+        return self._playback_worker is not None and self._playback_worker.is_alive()
+
+    def _playback_worker_main(
+        self,
+        url: str,
+        optional_a: str | None,
+        optional_b: str | None,
+        generation: int,
+        cancel_event: threading.Event,
+    ) -> None:
+        """后台线程入口：只做预检并通过队列汇报，不碰任何控件、不启动进程。"""
+        try:
+            info = inspect_playlist(
+                url,
+                optional_a,
+                optional_b,
+                cancel_event=cancel_event,
+            )
+        except DownloadCancelled:
+            self._message_queue.put((MSG_PLAYBACK_CANCELLED, (generation, None)))
+        except HLSDownloaderError as exc:
+            self._message_queue.put((MSG_PLAYBACK_FAILED, (generation, exc.message)))
+        except Exception as exc:  # noqa: BLE001 - 任何异常都不该让在线播放卡死
+            self._message_queue.put(
+                (MSG_PLAYBACK_FAILED, (generation, f"在线播放失败：{exc.__class__.__name__}：{exc}"))
+            )
+        else:
+            self._message_queue.put((MSG_PLAYBACK_READY, (generation, info)))
+
+    def _apply_playback_result(self, kind: str, generation: int, payload: object) -> None:
+        """在主线程处理预检结果；过期消息直接丢弃。"""
+        if generation != self._playback_generation:
+            return
+
+        self._playback_worker = None
+        self._playback_cancel = None
+
+        if kind == MSG_PLAYBACK_READY:
+            if not isinstance(payload, PlaybackInfo):
+                # 内部约定被破坏。不用 assert（python -O 下会失效），宁可当作
+                # 失败处理，也不要让面板永远停在「正在获取播放列表…」。
+                self.playback_panel.show_failed("内部错误：播放信息无效，详见日志。")
+                self.log_panel.append(
+                    f"在线播放消息载荷类型异常：{type(payload).__name__}", "error"
+                )
+                return
+            self._start_playback_process(payload)
+        elif kind == MSG_PLAYBACK_FAILED:
+            message = str(payload)
+            self.playback_panel.show_failed(message)
+            self.log_panel.append(f"在线播放失败：{message}", "error")
+        else:  # MSG_PLAYBACK_CANCELLED
+            self.playback_panel.show_stopped()
+            self.log_panel.append("已取消在线播放。", "warn")
+
+    def _start_playback_process(self, info: PlaybackInfo) -> None:
+        """启动播放器进程。只在 GUI 主线程里碰子进程。"""
+        try:
+            # 沿用上次选中的倍速，免得每次都从 1× 重新调
+            process = launch_playback(info.url, speed=self._playback_speed)
+        except PlayerError as exc:
+            self.playback_panel.show_failed(exc.message)
+            self.log_panel.append(f"在线播放失败：{exc.message}", "error")
+            return
+
+        self._playback_process = process
+        self.playback_panel.show_playing(
+            info, player_name=process.name, controlled=process.supports_control
+        )
+        for warning in info.warnings:
+            self.log_panel.append(f"提示：{warning}", "warn")
+        self.log_panel.append(
+            f"已启动播放器 {process.name}（{format_playback_summary(info)}）。"
+            "播放器自行在线取流，程序不保存任何分片。",
+            "info",
+        )
+        if not process.supports_control:
+            self.log_panel.append(
+                "该播放器没有控制通道：进度条与倍速不可用。安装 mpv 后可启用。",
+                "warn",
+            )
+        self._poll_playback_process()
+
+    def _poll_playback_process(self) -> None:
+        """轮询播放器进程：用户自己关掉播放器窗口后要把面板恢复回来。"""
+        self._playback_poll_id = None
+        process = self._playback_process
+        if process is None or self._closing:
+            return
+
+        code = process.poll()
+        if code is None:
+            # 位置由播放器推来（mpv 的 IPC 是异步事件，只能靠轮询取快照）。
+            # 不支持的播放器这两个方法返回 None，面板保持原样。
+            self.playback_panel.update_progress(process.position(), process.duration())
+            try:
+                self._playback_poll_id = self.after(
+                    PLAYBACK_POLL_INTERVAL_MS, self._poll_playback_process
+                )
+            except Exception:  # pragma: no cover - 解释器正在退出
+                self._playback_poll_id = None
+            return
+
+        self._playback_process = None
+        # 用户点「停止播放」的路径会先取消轮询，所以走到这里一定是播放器自己
+        # 退出的。
+        self._report_playback_exit(code, process)
+
+    def _report_playback_exit(self, code: int, process) -> None:
+        """播放器自己退出后，把结果讲清楚。
+
+        不能只看返回码：实测 ffplay 遇到 404、不支持的编码这类致命错误时
+        **同样以 0 退出**。真正的信号是它有没有报错（mpv 由 ``end-file`` 原因与
+        错误日志给出，ffplay 只能看 stderr），以及是不是刚起来就退了。
+        """
+        hint = process.failure_hint() if hasattr(process, "failure_hint") else ""
+        elapsed = getattr(process, "elapsed_seconds", None)
+        elapsed = elapsed() if callable(elapsed) else None
+        ended_with_error = False
+        checker = getattr(process, "ended_with_error", None)
+        if callable(checker):
+            ended_with_error = bool(checker())
+
+        if not ended_with_error and code == 0 and not hint:
+            self.playback_panel.show_stopped()
+            self.log_panel.append("播放器已结束播放。", "info")
+            return
+
+        if not ended_with_error and elapsed is not None and elapsed < PLAYBACK_STARTUP_GRACE_SECONDS:
+            # 没报错但刚起来就退了：多半是启动就失败
+            ended_with_error = True
+
+        if elapsed is not None and elapsed < PLAYBACK_STARTUP_GRACE_SECONDS:
+            self.playback_panel.show_failed("播放器未能开始播放，原因见日志。")
+            self.log_panel.append(
+                f"播放器启动后 {elapsed:.1f} 秒即退出（返回码 {code}），它没能开始播放。",
+                "error",
+            )
+            level = "error"
+        else:
+            played = f"，已播放 {format_elapsed(elapsed)}" if elapsed else ""
+            self.playback_panel.show_stopped()
+            self.log_panel.append(
+                f"播放器已结束{played}（返回码 {code}），但期间有错误。", "warn"
+            )
+            level = "warn"
+
+        if hint:
+            self.log_panel.append(f"播放器输出：\n{hint}", level)
+        else:
+            self.log_panel.append(
+                "播放器没有给出错误详情。若怀疑是链接问题，可以用同一个链接试一次"
+                "「开始下载」：下载能取到播放列表和分片、而播放器播不了，通常说明"
+                "播放器不支持该内容的编码或容器。",
+                "warn",
+            )
+
+    def _stop_playback_on_close(self) -> None:
+        """关窗时结束在线播放。
+
+        播放器是独立进程，不主动结束的话窗口关掉它还会留在桌面上。这里不走
+        :func:`~hls_downloader.player.stop_playback` 的等待逻辑：窗口马上就
+        销毁了，直接请求终止即可。
+        """
+        if self._playback_cancel is not None:
+            self._playback_cancel.set()
+        self._playback_generation += 1
+
+        if self._playback_poll_id is not None:
+            try:
+                self.after_cancel(self._playback_poll_id)
+            except Exception:  # pragma: no cover - 解释器正在退出
+                pass
+            self._playback_poll_id = None
+
+        process = self._playback_process
+        self._playback_process = None
+        if process is None:
+            return
+
+        # 先断 IPC 通道，否则读线程会一直挂在管道上
+        close = getattr(process, "close", None)
+        if callable(close):
+            try:
+                close()
+            except OSError:  # pragma: no cover - 通道可能已经断了
+                pass
+
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:  # pragma: no cover - 进程可能刚好自己退了
+                pass
 
     # ------------------------------------------------------------------
     # 后台任务与消息处理
@@ -831,10 +1295,8 @@ class MainWindow(ctk.CTk):
                 workers=workers,
                 resume=resume,
                 # 开启续传时不能把分片放进「关闭窗口就删除」的会话目录，
-                # 否则重启程序后续不上；交给核心放到系统临时目录下的固定位置。
-                temp_dir=(
-                    str(self._temp_root) if (self._temp_root and not resume) else None
-                ),
+                # 否则重启程序后续不上；交给核心放到输出目录下的固定位置。
+                temp_dir=str(self._temp_root) if self._temp_root else None,
                 logger=task_logger,
             )
         except DownloadCancelled:
@@ -908,6 +1370,7 @@ class MainWindow(ctk.CTk):
             result = payload
             assert isinstance(result, DownloadResult)
             self._set_running(False)
+            self._cleanup_temp_root()
             self.status_panel.show_completed(result)
             self.log_panel.append(
                 "下载完成："
@@ -920,13 +1383,18 @@ class MainWindow(ctk.CTk):
         elif kind == MSG_FAILED:
             message = str(payload)
             self._set_running(False)
+            self._cleanup_temp_root()
             self.status_panel.show_failed(message)
             self.log_panel.append(f"下载失败：{message}", "error")
             messagebox.showerror("下载失败", message, parent=self)
         elif kind == MSG_CANCELLED:
             self._set_running(False)
+            self._cleanup_temp_root()
             self.status_panel.show_cancelled()
             self.log_panel.append("任务已取消，临时文件已清理。", "warn")
+        elif kind in (MSG_PLAYBACK_READY, MSG_PLAYBACK_FAILED, MSG_PLAYBACK_CANCELLED):
+            generation, playback_payload = payload  # type: ignore[misc]
+            self._apply_playback_result(kind, int(generation), playback_payload)
 
     # ------------------------------------------------------------------
     # 关闭处理
@@ -940,6 +1408,8 @@ class MainWindow(ctk.CTk):
                 parent=self,
             ):
                 return
+            # 用户已经确认退出：在线播放没必要再陪着等下载线程收尾
+            self._stop_playback_on_close()
             if self._cancel_event is not None:
                 self._cancel_event.set()
             self.log_panel.append("正在取消任务并退出…", "warn")
@@ -980,6 +1450,7 @@ class MainWindow(ctk.CTk):
                 pass
             self._poll_after_id = None
 
+        self._stop_playback_on_close()
         self._cleanup_temp_root()
         self.destroy()
 

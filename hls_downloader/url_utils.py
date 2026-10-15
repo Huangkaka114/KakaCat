@@ -104,4 +104,7 @@ def redact_url(url: str) -> str:
         redacted_path = "/…/" + segments[-1]
 
     query = "?…" if parts.query else ""
-    return f"{parts.scheme}://{parts.netloc}{redacted_path}{query}"
+    # 只保留主机（含端口），去掉 ``user:password@`` 形式的用户信息：有些服务把
+    # 令牌放在那里，那不是"路径"能脱敏掉的。
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return f"{parts.scheme}://{netloc}{redacted_path}{query}"

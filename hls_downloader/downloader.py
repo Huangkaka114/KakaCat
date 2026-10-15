@@ -44,7 +44,14 @@ from .url_utils import get_extension, redact_url, validate_http_url, without_que
 from .util import process_optional_params, rebuild_url
 
 
-__all__ = ["download_hls_video", "ProgressCallback", "HTTP_TIMEOUT"]
+__all__ = [
+    "download_hls_video",
+    "prepare_playlist_url",
+    "create_session",
+    "request_text",
+    "ProgressCallback",
+    "HTTP_TIMEOUT",
+]
 
 #: 进度回调：接收一个 :class:`~hls_downloader.models.ProgressReport`
 ProgressCallback = Callable[[ProgressReport], None]
@@ -77,6 +84,72 @@ PROGRESS_EMIT_INTERVAL_SECONDS = 0.1
 MAX_PERCENT_BEFORE_COMPLETION = 99.0
 
 USER_AGENT = "KakaCat-HLSDownloader/1.0"
+
+
+def create_session(*, workers: int = DEFAULT_WORKERS) -> requests.Session:
+    """创建一个带默认请求头的会话。
+
+    下载与在线播放共用这一个工厂，保证两条路径的请求特征（User-Agent、
+    连接池大小）一致；``workers`` 只影响连接池大小。
+    """
+    session = requests.Session()
+    # 必须直接赋值：``requests.Session()`` 初始化时就带了默认的
+    # ``python-requests/…``，用 ``setdefault`` 永远覆盖不掉，我们的 UA 会一直
+    # 发不出去。
+    session.headers["User-Agent"] = USER_AGENT
+    _configure_connection_pool(session, workers)
+    return session
+
+
+def prepare_playlist_url(
+    playlist_url: str,
+    optional_a: str | None = None,
+    optional_b: str | None = None,
+    *,
+    logger: logging.Logger | None = None,
+) -> str:
+    """校验用户填写的链接，并按可选参数重建真正的播放列表请求 URL。
+
+    下载与在线播放共用这一个入口，保证两条路径对 URL 的处理完全一致：
+    先做 :func:`~hls_downloader.url_utils.validate_http_url` 校验，再把参数 A/B
+    归一化后交给 :func:`~hls_downloader.util.rebuild_url` 做本地签名。
+
+    Args:
+        playlist_url: 用户填写的链接（媒体播放列表地址，或填了参数 B 时的下载链接）。
+        optional_a: 参数 A。填写时视为授权密钥，只参与本地签名计算。
+        optional_b: 参数 B。填写时视为基础地址，用于从下载链接推导真实地址。
+        logger: 可选日志记录器。
+
+    Returns:
+        实际应当请求的播放列表 URL。
+
+    Raises:
+        InvalidUrlError: URL 为空、协议不支持或格式错误。
+    """
+    log = logger or logging.getLogger("hls_downloader")
+
+    url = validate_http_url(playlist_url)
+
+    # 预留参数：先归一化，再交给 util 工具包处理。
+    options = DownloadOptions(optional_a=optional_a, optional_b=optional_b).normalized()
+    processed_a, processed_b = process_optional_params(options.optional_a, options.optional_b)
+    # util 返回后再归一化一次：当前是恒等操作，将来 util 若返回带空白或空串的值
+    # 也能被正确收敛。
+    options = DownloadOptions(optional_a=processed_a, optional_b=processed_b).normalized()
+
+    if options.optional_a:
+        # 参数 A 是授权密钥，参数 B 是基础地址：重建播放列表请求 URL。
+        # 密钥只参与本地签名计算，因此日志里只给出脱敏后的 URL，
+        # 不打印签名与密钥本身。填了 B 时，url 是下载链接，由模板推导真实地址。
+        url = rebuild_url(url, options.optional_a, base=options.optional_b)
+        log.debug("已按参数 A（和参数 B）重建播放列表请求 URL：%s", redact_url(url))
+    elif options.optional_b:
+        log.warning(
+            "填写了参数 B（基础地址）但没有参数 A（密钥），无法推导真实地址，"
+            "本次按原始链接请求。"
+        )
+
+    return url
 
 
 def download_hls_video(
@@ -119,7 +192,8 @@ def download_hls_video(
         resume: 是否启用断点续传。开启时临时分片目录按链接固定命名，失败或取消
             后保留，再次执行同一任务会跳过已经下好的分片；``False`` 表示每次都
             从头下载，失败时按 ``keep_temp_on_failure`` 决定是否保留临时文件。
-        temp_dir: 存放分片临时文件的父目录，默认使用系统临时目录。
+        temp_dir: 存放分片临时文件的父目录，默认放在输出文件所在目录下。分片
+            可能有几个 GB，放在输出盘上可以避免写满系统盘。
         keep_temp_on_failure: 未开启续传时，失败或取消是否保留临时分片。
         ffmpeg_path: FFmpeg 可执行文件路径；需要重新封装时使用。
         logger: 可选日志记录器。
@@ -143,34 +217,14 @@ def download_hls_video(
     """
     log = logger or logging.getLogger("hls_downloader")
 
-    url = validate_http_url(playlist_url)
+    # URL 处理（校验 + 可选参数签名）走共用入口：在线播放调用的是同一个函数，
+    # 两条路径对同一个链接算出的请求地址因此永远一致。
+    url = prepare_playlist_url(playlist_url, optional_a, optional_b, logger=log)
     target = _prepare_output(output_path, overwrite=overwrite)
-
-    # 预留参数：先归一化，再交给 util 工具包处理。
-    options = DownloadOptions(optional_a=optional_a, optional_b=optional_b).normalized()
-    processed_a, processed_b = process_optional_params(options.optional_a, options.optional_b)
-    # util 返回后再归一化一次：当前是恒等操作，将来 util 若返回带空白或空串的值
-    # 也能被正确收敛。
-    options = DownloadOptions(optional_a=processed_a, optional_b=processed_b).normalized()
-
-    if options.optional_a:
-        # 参数 A 是授权密钥，参数 B 是基础地址：重建播放列表请求 URL。
-        # 密钥只参与本地签名计算，因此日志里只给出脱敏后的 URL，
-        # 不打印签名与密钥本身。填了 B 时，url 是下载链接，由模板推导真实地址。
-        url = rebuild_url(url, options.optional_a, base=options.optional_b)
-        log.debug("已按参数 A（和参数 B）重建播放列表请求 URL：%s", redact_url(url))
-    elif options.optional_b:
-        log.warning(
-            "填写了参数 B（基础地址）但没有参数 A（密钥），无法推导真实地址，"
-            "本次按原始链接请求。"
-        )
 
     cancel = cancel_event if cancel_event is not None else threading.Event()
     owns_session = session is None
-    active_session = session or requests.Session()
-    if owns_session:
-        active_session.headers.setdefault("User-Agent", USER_AGENT)
-        _configure_connection_pool(active_session, workers)
+    active_session = session or create_session(workers=workers)
 
     try:
         return _run(
@@ -236,7 +290,7 @@ def _run(
     try:
         progress.set_stage(TaskStage.FETCHING_PLAYLIST, "正在获取播放列表…")
         log.info("正在获取播放列表：%s", redact_url(url))
-        text = _request_text(
+        text = request_text(
             session, url, cancel=cancel, max_retries=max_retries, log=log, what="获取播放列表"
         )
 
@@ -277,7 +331,9 @@ def _run(
         # 上一次的分片——片源换了（重新编码、换集）会落到新目录，不会把旧内容
         # 当成新内容拼进产物。
         temp_path = _create_temp_dir(
-            temp_dir, identity=_resume_identity(url, target, text) if resume else None
+            temp_dir,
+            identity=_resume_identity(url, target, text) if resume else None,
+            default_parent=target.parent,
         )
         succeeded = False
         try:
@@ -887,7 +943,7 @@ def _merge_into_place(
     return size
 
 
-def _request_text(
+def request_text(
     session: requests.Session,
     url: str,
     *,
@@ -896,7 +952,11 @@ def _request_text(
     log: logging.Logger,
     what: str,
 ) -> str:
-    """带有限重试的 GET 请求，返回响应文本。"""
+    """带有限重试的 GET 请求，返回响应文本。
+
+    下载与在线播放共用：在线播放的预检必须用与下载完全相同的超时与重试行为，
+    否则"下载能取到、在线播放取不到"这类差异会很难排查。
+    """
     last_error: PlaylistFetchError | None = None
 
     for attempt in range(max_retries + 1):
@@ -1053,8 +1113,14 @@ def _create_temp_dir(
     temp_dir: str | os.PathLike[str] | None,
     *,
     identity: str | None = None,
+    default_parent: Path | None = None,
 ) -> Path:
-    """在指定父目录（默认系统临时目录）下准备分片临时目录。
+    """在指定父目录下准备分片临时目录。
+
+    显式给了 ``temp_dir`` 就用它；否则退回 ``default_parent``——调用方传的是
+    **输出文件所在目录**。分片动辄几个 GB，默认丢进系统临时目录很容易把系统盘
+    写满，而输出目录本来就是用户自己挑的、空间够用的地方，其可写性也已经在
+    :func:`_prepare_output` 里校验过。
 
     给了 ``identity`` 时目录名由它决定，同一个任务第二次运行会落回同一个目录，
     从而能跳过已经下好的分片（断点续传）；不给时每次都是全新的随机目录。
@@ -1066,6 +1132,8 @@ def _create_temp_dir(
             parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise HLSDownloaderError(f"无法创建临时目录 {parent}：{exc}") from exc
+    else:
+        parent = default_parent
 
     try:
         if identity is None:

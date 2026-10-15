@@ -183,6 +183,25 @@ def test_find_ffmpeg_returns_string_or_none():
     assert found is None or isinstance(found, str)
 
 
+def test_find_ffmpeg_prefers_a_version_shipped_with_the_app(tmp_path, monkeypatch):
+    """打包时把 ffmpeg.exe 随包放在 bin/ 下，就必须优先用它。
+
+    否则用户明明"随包装好了"，程序还是去 PATH 里找不到、报未检测到。
+    """
+    bundled = tmp_path / "ffmpeg.exe"
+    monkeypatch.setattr(merger, "find_bundled_tool", lambda name: bundled)
+    monkeypatch.setattr(merger.shutil, "which", lambda name: r"C:\somewhere\ffmpeg.exe")
+
+    assert merger.find_ffmpeg() == str(bundled)
+
+
+def test_find_ffmpeg_falls_back_to_the_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(merger, "find_bundled_tool", lambda name: None)
+    monkeypatch.setattr(merger.shutil, "which", lambda name: r"C:\somewhere\ffmpeg.exe")
+
+    assert merger.find_ffmpeg() == r"C:\somewhere\ffmpeg.exe"
+
+
 # --------------------------------------------------------------------------
 # 回归测试：合并阶段必须响应取消
 # --------------------------------------------------------------------------

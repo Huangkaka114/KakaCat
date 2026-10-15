@@ -11,9 +11,21 @@ from typing import Callable
 import customtkinter as ctk
 
 from hls_downloader.models import DownloadResult, ProgressReport, TaskStage
+from hls_downloader.playback import PlaybackInfo
+from hls_downloader.player import SPEED_CHOICES
 
 from . import theme
 from .theme import Fonts
+
+#: 用 mpv 时的提示：进度条在窗口里，倍速在这块面板上
+CONTROL_HINT_MPV = (
+    "进度条在播放器窗口里（拖动跳转，空格暂停，f 全屏）；"
+    "倍速用下面的按钮，或用播放器窗口里的 [ / ] 快捷键。"
+)
+#: ffplay 没有窗口内进度条，也没有控制通道
+CONTROL_HINT_FFPLAY = (
+    "当前播放器（ffplay）窗口里没有进度条与倍速；安装 mpv 后即可在窗口里拖动跳转与调速。"
+)
 
 #: 日志区域最多保留的行数，避免长时间运行后占用过多内存
 MAX_LOG_LINES = 1500
@@ -62,6 +74,45 @@ def format_elapsed(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f} 秒"
     return format_duration(seconds)
+
+
+def format_clock(seconds: float | None) -> str:
+    """把秒数格式化成播放器式的时间（``12:34`` / ``1:02:03``）。
+
+    与 :func:`format_duration` 不同：那个说的是人话（"1 分 30 秒"），这个要在
+    进度条旁边跟着秒数跳动，用 ``mm:ss`` 才不晃眼。
+    """
+    if seconds is None or seconds < 0:
+        return "—"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def format_playback_summary(info: PlaybackInfo) -> str:
+    """把在线播放的预检结果浓缩成一行说明。
+
+    主播放列表与直播列表拿不到分片级信息，只说明播放器会怎么处理；普通 VOD
+    则给出分片数、总时长和加密情况。
+    """
+    if info.is_master:
+        return "主播放列表 · 播放器将自行选择码率"
+    if info.is_live:
+        return "直播或尚未结束的列表 · 将持续播放"
+
+    parts = [f"{info.segment_count} 个分片"]
+    if info.total_duration > 0:
+        parts.append(f"约 {format_duration(info.total_duration)}")
+    # 播放列表显式写了 METHOD=NONE 时解析出来是字符串 "NONE"，那同样是未加密
+    method = info.encryption_method
+    if method and method.upper() != "NONE":
+        parts.append(f"加密：{method}")
+    else:
+        parts.append("未加密")
+    return " · ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -495,3 +546,326 @@ class LogPanel(Card):
             self.textbox.see("end")
         except AttributeError:  # pragma: no cover - 兼容不同 CTk 版本
             self.textbox.yview_moveto(1.0)
+
+
+# --------------------------------------------------------------------------
+# 在线播放面板
+# --------------------------------------------------------------------------
+
+
+class PlaybackPanel(Card):
+    """在线播放面板：只播放，不下载。
+
+    面板自己不碰网络，也不碰播放器进程——它只把「播放 / 停止」转交给主窗口的
+    回调，并展示当前状态。播放器进程的生命周期完全由 :class:`~gui.main_window.MainWindow`
+    管理，这样线程与子进程的规则只在一个地方。
+    """
+
+    def __init__(
+        self,
+        master,
+        fonts: Fonts,
+        *,
+        on_play: Callable[[], None],
+        on_stop: Callable[[], None],
+        on_copy: Callable[[], None],
+        on_speed: Callable[[float], None],
+        **kwargs,
+    ):
+        super().__init__(master, **kwargs)
+        self._fonts = fonts
+        self._duration: float | None = None
+        self._on_speed = on_speed
+        #: 当前倍速在 SPEED_CHOICES 里的下标
+        self._speed_index = SPEED_CHOICES.index(1.0)
+        #: 播放器有没有把位置/时长报给我们的通道（mpv 有，ffplay 没有）
+        self._has_control_channel = False
+        self.columnconfigure(0, weight=1)
+
+        SectionTitle(self, "在线播放", fonts).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=theme.SPACE_LG,
+            pady=(theme.SPACE_LG, theme.SPACE_SM),
+        )
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "只播放，不下载：不写临时文件，也不占用保存目录。"
+                "使用上面填写的链接与可选参数，可与下载同时进行。"
+            ),
+            font=fonts.small,
+            text_color=theme.TEXT_SECONDARY,
+            justify="left",
+            anchor="w",
+            wraplength=380,
+        ).grid(row=1, column=0, sticky="ew", padx=theme.SPACE_LG)
+
+        self._info_label = ctk.CTkLabel(
+            self,
+            text="尚未播放。",
+            font=fonts.hint,
+            text_color=theme.TEXT_DIM,
+            justify="left",
+            anchor="w",
+            wraplength=380,
+        )
+        self._info_label.grid(
+            row=2, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, 0)
+        )
+
+        # 播放控制在**播放器窗口里**做（mpv 的 OSC 进度条与快捷键），这里只说明
+        # 去哪儿操作，不再另做一套控件——同一个功能放两个地方只会让人犯迷糊。
+        self._hint_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=fonts.hint,
+            text_color=theme.TEXT_DIM,
+            justify="left",
+            anchor="w",
+            wraplength=380,
+        )
+        self._hint_label.grid(row=3, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, 0))
+
+        # 只读的播放进度文字：mpv 会把位置推给我们，属于状态展示而非控制
+        self._time_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=fonts.hint,
+            text_color=theme.TEXT_DIM,
+            anchor="w",
+        )
+        self._time_label.grid(row=4, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(2, 0))
+
+        # 倍速只能由我们提供按钮：mpv 窗口里**没有**倍速控件（它的 osc.lua 是编译
+        # 进 exe 的，只有一个可拖的进度条），只有 [ / ] 快捷键。进度条留在播放器
+        # 窗口里，倍速在这里给一组按钮。
+        speed_row = ctk.CTkFrame(self, fg_color="transparent")
+        speed_row.grid(row=5, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, 0))
+        speed_row.columnconfigure(4, weight=1)
+
+        ctk.CTkLabel(
+            speed_row, text="倍速", font=fonts.hint, text_color=theme.TEXT_DIM
+        ).grid(row=0, column=0, sticky="w", padx=(0, theme.SPACE_SM))
+
+        self._slower_button = self._speed_button(speed_row, "−", -1)
+        self._slower_button.grid(row=0, column=1, sticky="w")
+
+        self._speed_label = ctk.CTkLabel(
+            speed_row, text="1×", font=fonts.body_bold, text_color=theme.TEXT, width=52
+        )
+        self._speed_label.grid(row=0, column=2, sticky="w", padx=theme.SPACE_SM)
+
+        self._faster_button = self._speed_button(speed_row, "＋", 1)
+        self._faster_button.grid(row=0, column=3, sticky="w")
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(
+            row=6,
+            column=0,
+            sticky="ew",
+            padx=theme.SPACE_LG,
+            pady=(theme.SPACE_MD, theme.SPACE_LG),
+        )
+        buttons.columnconfigure(0, weight=1, uniform="playback")
+        buttons.columnconfigure(1, weight=1, uniform="playback")
+
+        self.play_button = ctk.CTkButton(
+            buttons,
+            text="播放",
+            font=fonts.body_bold,
+            height=theme.HEIGHT_BUTTON,
+            corner_radius=theme.RADIUS_BUTTON,
+            fg_color=theme.PRIMARY,
+            hover_color=theme.PRIMARY_HOVER,
+            text_color=theme.PRIMARY_TEXT,
+            command=on_play,
+        )
+        self.play_button.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_SM))
+
+        self.stop_button = ctk.CTkButton(
+            buttons,
+            text="停止播放",
+            font=fonts.body,
+            height=theme.HEIGHT_BUTTON,
+            corner_radius=theme.RADIUS_BUTTON,
+            fg_color=theme.BG_HOVER,
+            hover_color=theme.BORDER_STRONG,
+            text_color=theme.TEXT,
+            border_width=1,
+            border_color=theme.BORDER,
+            state="disabled",
+            command=on_stop,
+        )
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_SM, 0))
+
+        # 复制签名后的播放列表地址：给「在别的设备上播」用。算出来的地址是
+        # 自包含的，手机上的 HLS 播放器直接就能打开。
+        self.copy_button = ctk.CTkButton(
+            self,
+            text="复制播放地址（含签名）",
+            font=fonts.small,
+            height=32,
+            corner_radius=theme.RADIUS_BUTTON,
+            fg_color=theme.BG_HOVER,
+            hover_color=theme.BORDER_STRONG,
+            text_color=theme.TEXT,
+            border_width=1,
+            border_color=theme.BORDER,
+            command=on_copy,
+        )
+        self.copy_button.grid(
+            row=7, column=0, sticky="ew", padx=theme.SPACE_LG, pady=(theme.SPACE_SM, theme.SPACE_LG)
+        )
+
+    # -- 状态更新 ---------------------------------------------------------
+
+    def reset(self) -> None:
+        """回到「尚未播放」状态。"""
+        self._apply(
+            text="尚未播放。",
+            color=theme.TEXT_DIM,
+            play_state="normal",
+            stop_state="disabled",
+            controlled=False,
+        )
+
+    def show_inspecting(self) -> None:
+        """正在获取并解析播放列表。"""
+        self._apply(
+            text="正在获取播放列表…",
+            color=theme.ACCENT,
+            play_state="disabled",
+            stop_state="normal",
+            controlled=False,
+        )
+
+    def show_playing(self, info: PlaybackInfo, *, player_name: str, controlled: bool) -> None:
+        """播放器已启动。
+
+        ``controlled`` 表示播放器会不会把位置报给我们。它只决定这行进度文字
+        有没有内容，以及提示该往哪儿去操作播放——控制本身在播放器窗口里。
+        """
+        self._apply(
+            text=f"正在播放（{player_name}）：{format_playback_summary(info)}",
+            color=theme.SUCCESS,
+            play_state="disabled",
+            stop_state="normal",
+            controlled=controlled,
+        )
+
+    def show_failed(self, message: str) -> None:
+        """在线播放失败：只展示第一行，完整信息在日志里。"""
+        first_line = message.splitlines()[0] if message else "在线播放失败。"
+        self._apply(
+            text=first_line,
+            color=theme.ERROR,
+            play_state="normal",
+            stop_state="disabled",
+            controlled=False,
+        )
+
+    def show_stopped(self) -> None:
+        """播放已结束或被停止。"""
+        self._apply(
+            text="播放已结束。",
+            color=theme.TEXT_DIM,
+            play_state="normal",
+            stop_state="disabled",
+            controlled=False,
+        )
+
+    # -- 播放进度（只读） --------------------------------------------------
+
+    def update_progress(self, position: float | None, duration: float | None) -> None:
+        """按播放器推来的位置刷新这行只读进度文字。
+
+        播放器没有控制通道时什么也不做——ffplay 压根报不出位置。
+        """
+        if not self._has_control_channel:
+            return
+        if duration is not None and duration > 0:
+            self._duration = duration
+        if position is None:
+            return
+
+        total = self._duration
+        self._time_label.configure(
+            text=f"已播放 {format_clock(position)} / {format_clock(total)}",
+            text_color=theme.TEXT_SECONDARY,
+        )
+
+    # -- 倍速 -------------------------------------------------------------
+
+    def speed(self) -> float:
+        """当前选中的倍速。主窗口重新起播放时沿用它。"""
+        return SPEED_CHOICES[self._speed_index]
+
+    def _speed_button(self, master, text: str, step: int):
+        return ctk.CTkButton(
+            master,
+            text=text,
+            width=34,
+            height=26,
+            font=self._fonts.body_bold,
+            corner_radius=theme.RADIUS_INPUT,
+            fg_color=theme.BG_INPUT,
+            hover_color=theme.BG_HOVER,
+            text_color=theme.TEXT,
+            border_width=1,
+            border_color=theme.BORDER,
+            state="disabled",
+            command=lambda: self._step_speed(step),
+        )
+
+    def _step_speed(self, step: int) -> None:
+        """按档位加减倍速；已经在两端就不动。"""
+        if not self._has_control_channel:
+            return
+        index = min(max(0, self._speed_index + step), len(SPEED_CHOICES) - 1)
+        if index != self._speed_index:
+            self._speed_index = index
+            self._update_speed_label()
+            self._on_speed(SPEED_CHOICES[index])
+        self._refresh_speed_buttons()
+
+    def _update_speed_label(self) -> None:
+        self._speed_label.configure(text=f"{SPEED_CHOICES[self._speed_index]:g}×")
+
+    def _refresh_speed_buttons(self) -> None:
+        """到顶/到底时把对应的按钮灰掉，免得点了没反应。"""
+        usable = self._has_control_channel
+        self._slower_button.configure(
+            state="normal" if usable and self._speed_index > 0 else "disabled"
+        )
+        self._faster_button.configure(
+            state="normal"
+            if usable and self._speed_index < len(SPEED_CHOICES) - 1
+            else "disabled"
+        )
+
+    # -- 内部实现 ---------------------------------------------------------
+
+    def _apply(
+        self,
+        *,
+        text: str,
+        color: str,
+        play_state: str,
+        stop_state: str,
+        controlled: bool,
+    ) -> None:
+        self._info_label.configure(text=text, text_color=color)
+        self.play_button.configure(state=play_state)
+        self.stop_button.configure(state=stop_state)
+        self._has_control_channel = controlled
+        self._duration = None
+        self._time_label.configure(text="")
+        self._hint_label.configure(
+            text=CONTROL_HINT_MPV if controlled else CONTROL_HINT_FFPLAY,
+            text_color=theme.TEXT_DIM if controlled else theme.WARNING,
+        )
+        self._refresh_speed_buttons()
+

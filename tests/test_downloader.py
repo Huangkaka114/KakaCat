@@ -760,6 +760,110 @@ def test_merge_failure_reports_failed_stage(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 
+def test_owned_session_identifies_the_application():
+    """``requests.Session()`` 自带 python-requests 的 UA，setdefault 盖不掉。"""
+    session = downloader.create_session()
+    try:
+        assert session.headers["User-Agent"] == downloader.USER_AGENT
+    finally:
+        session.close()
+
+
+def test_temp_dir_defaults_to_the_output_directory(tmp_path, monkeypatch):
+    """分片目录默认建在输出文件旁边。
+
+    成功时临时目录会被删掉，看不到痕迹，所以这里直接把建目录那一步拦下来
+    看它实际选了哪个父目录。
+    """
+    real = downloader._create_temp_dir
+    captured: dict = {}
+
+    def spy(temp_dir, **kwargs):
+        path = real(temp_dir, **kwargs)
+        captured["path"] = path
+        return path
+
+    monkeypatch.setattr(downloader, "_create_temp_dir", spy)
+
+    output_dir = tmp_path / "videos"
+    output_dir.mkdir()
+    session = make_session()
+
+    downloader.download_hls_video(PLAYLIST_URL, output_dir / "out.ts", session=session)
+
+    assert captured["path"].parent == output_dir
+    assert [p.name for p in output_dir.iterdir()] == ["out.ts"]
+
+
+def test_resume_dir_is_created_next_to_the_output_file(tmp_path):
+    """失败保留的续传目录必须落在输出目录里，而不是系统盘。"""
+    routes: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(body=build_media_playlist(NAMES))
+    }
+    routes.update(build_segment_routes(BASE, NAMES[:2]))
+    routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+    session = FakeSession(routes)
+
+    output_dir = tmp_path / "videos"
+    output_dir.mkdir()
+
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            output_dir / "out.ts",
+            session=session,
+            max_retries=0,
+            workers=1,  # 顺序下载，落在断点前的分片数量才是确定的
+        )
+
+    leftovers = [p for p in output_dir.iterdir() if p.name.startswith("hls_resume_")]
+    assert len(leftovers) == 1, f"续传目录不在输出目录下：{list(output_dir.iterdir())}"
+    # 已经下好的前两个分片留在里面，下次可以直接跳过
+    assert len(list(leftovers[0].glob("*.ts"))) == 2
+
+
+def test_temp_dir_defaults_to_the_output_directory_without_resume(tmp_path):
+    """关掉续传时用的是随机目录，同样应当落在输出目录下。"""
+    routes: dict[str, object] = {
+        PLAYLIST_URL: FakeResponse(body=build_media_playlist(NAMES))
+    }
+    routes.update(build_segment_routes(BASE, NAMES[:2]))
+    routes[f"{BASE}{NAMES[2]}"] = FakeResponse(status_code=500)
+    session = FakeSession(routes)
+
+    output_dir = tmp_path / "videos"
+    output_dir.mkdir()
+
+    with pytest.raises(SegmentDownloadError):
+        downloader.download_hls_video(
+            PLAYLIST_URL,
+            output_dir / "out.ts",
+            session=session,
+            resume=False,
+            keep_temp_on_failure=True,
+            max_retries=0,
+        )
+
+    leftovers = [p for p in output_dir.iterdir() if p.name.startswith("hls_segments_")]
+    assert len(leftovers) == 1, f"临时目录不在输出目录下：{list(output_dir.iterdir())}"
+
+
+def test_explicit_temp_dir_still_wins(tmp_path):
+    """显式指定 temp_dir 时不受新默认值影响。"""
+    output_dir = tmp_path / "videos"
+    output_dir.mkdir()
+    work = tmp_path / "elsewhere"
+    work.mkdir()
+    session = make_session()
+
+    downloader.download_hls_video(
+        PLAYLIST_URL, output_dir / "out.ts", session=session, temp_dir=work
+    )
+
+    assert list(work.iterdir()) == []
+    assert not any(p.name.startswith("hls_") for p in output_dir.iterdir())
+
+
 def test_temp_files_are_cleaned_after_success(tmp_path):
     work = tmp_path / "work"
     work.mkdir()

@@ -30,11 +30,21 @@ htmlcov/
 *.concat.txt
 *.m3u8.tmp
 _hls_tmp*/
+# 分片临时目录默认建在输出目录下，下载到项目目录里时不该入库
+hls_resume_*/
+hls_segments_*/
+
+# ---- 程序自己的运行数据 ----
+# 便携模式下程序会在自己目录里建 data/（临时文件、将来的日志与配置），
+# 那是本机运行产物，不该入库
+/data/
 
 # ---- 编辑器与操作系统 ----
 # JetBrains / PyCharm 的本机配置，因人而异，不入库
 .idea/
 .vscode/
+# Claude Code 的工作目录（含 worktree，里面是整份仓库副本）
+.claude/
 .DS_Store
 Thumbs.db
 desktop.ini

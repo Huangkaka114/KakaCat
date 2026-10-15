@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from .app_paths import find_bundled_tool
 from .models import DownloadCancelled, MergeError, MergeResult, SegmentKind
 
 COPY_CHUNK_SIZE = 1024 * 1024
@@ -46,7 +47,14 @@ _FFMPEG_MUXERS = {
 
 
 def find_ffmpeg() -> str | None:
-    """在 PATH 中查找 FFmpeg，找到返回可执行文件路径，否则返回 ``None``。"""
+    """查找 FFmpeg：先看随程序分发的，再查 PATH。
+
+    打包成客户端时会把 ``ffmpeg.exe`` 放在程序目录的 ``bin\\`` 里，所以必须
+    优先看它——否则用户明明"随包装好了"，程序还是报未检测到。
+    """
+    bundled = find_bundled_tool("ffmpeg")
+    if bundled is not None:
+        return str(bundled)
     return shutil.which("ffmpeg")
 
 

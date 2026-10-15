@@ -8,8 +8,10 @@ from gui.components import (
     format_bytes,
     format_duration,
     format_elapsed,
+    format_playback_summary,
     format_speed,
 )
+from hls_downloader.playback import PlaybackInfo
 from gui.main_window import default_filename_from_url, sanitize_filename
 
 
@@ -53,8 +55,34 @@ def test_sanitize_filename_truncates_very_long_names():
         ("https://cdn.test/", "video.ts"),
     ],
 )
-def test_default_filename_from_url(url, expected):
-    assert default_filename_from_url(url) == expected
+def test_default_filename_from_url_honours_the_given_suffix(url, expected):
+    assert default_filename_from_url(url, ".ts") == expected
+
+
+@pytest.mark.parametrize(
+    "ffmpeg_available,expected_suffix",
+    [(True, ".mp4"), (False, ".ts")],
+)
+def test_default_output_suffix_follows_ffmpeg(monkeypatch, ffmpeg_available, expected_suffix):
+    """.mp4 需要 FFmpeg 重新封装，没装时默认值必须是能直接成功的 .ts。"""
+    from gui import main_window as mw
+
+    monkeypatch.setattr(
+        mw, "find_ffmpeg", lambda: "/usr/bin/ffmpeg" if ffmpeg_available else None
+    )
+
+    assert mw.default_output_suffix() == expected_suffix
+
+
+def test_default_filename_follows_the_default_suffix(monkeypatch):
+    """文件名留空后缀时跟着 FFmpeg 走——有 FFmpeg 就是 .mp4。"""
+    from gui import main_window as mw
+
+    monkeypatch.setattr(mw, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    assert mw.default_filename_from_url("https://cdn.test/video/movie123.m3u8") == "movie123.mp4"
+
+    monkeypatch.setattr(mw, "find_ffmpeg", lambda: None)
+    assert mw.default_filename_from_url("https://cdn.test/video/movie123.m3u8") == "movie123.ts"
 
 
 def test_default_filename_from_url_is_sanitized():
@@ -104,3 +132,53 @@ def test_format_duration(seconds, expected):
 )
 def test_format_elapsed(seconds, expected):
     assert format_elapsed(seconds) == expected
+
+
+def test_format_playback_summary_reports_segments_and_duration():
+    info = PlaybackInfo(
+        url="https://cdn.test/a.m3u8", segment_count=12, total_duration=125.0
+    )
+
+    summary = format_playback_summary(info)
+
+    assert "12 个分片" in summary
+    assert "2 分 5 秒" in summary
+    assert "未加密" in summary
+
+
+def test_format_playback_summary_reports_the_encryption_method():
+    info = PlaybackInfo(
+        url="https://cdn.test/a.m3u8",
+        segment_count=3,
+        total_duration=12.0,
+        encryption_method="AES-128",
+    )
+
+    assert "AES-128" in format_playback_summary(info)
+
+
+def test_format_playback_summary_treats_method_none_as_unencrypted():
+    """播放列表显式写 METHOD=NONE 时解析结果是字符串 "NONE"，它不是加密。"""
+    info = PlaybackInfo(
+        url="https://cdn.test/a.m3u8",
+        segment_count=3,
+        total_duration=12.0,
+        encryption_method="NONE",
+    )
+
+    summary = format_playback_summary(info)
+
+    assert "NONE" not in summary
+    assert "未加密" in summary
+
+
+def test_format_playback_summary_handles_a_master_playlist():
+    summary = format_playback_summary(PlaybackInfo(url="https://cdn.test/a.m3u8", is_master=True))
+
+    assert "主播放列表" in summary
+
+
+def test_format_playback_summary_handles_a_live_playlist():
+    summary = format_playback_summary(PlaybackInfo(url="https://cdn.test/a.m3u8", is_live=True))
+
+    assert "直播" in summary
