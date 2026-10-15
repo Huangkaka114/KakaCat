@@ -46,6 +46,10 @@ packaging/resources/_preview.png
 # 那是本机运行产物，不该入库
 /data/
 
+# ---- 本机开发约定 ----
+# CLAUDE.md 是本机的开发约定说明，只服务本地工作流，不入库、不随仓库分发
+CLAUDE.md
+
 # ---- 编辑器与操作系统 ----
 # JetBrains / PyCharm 的本机配置，因人而异，不入库
 .idea/
