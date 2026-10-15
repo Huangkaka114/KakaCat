@@ -1,0 +1,93 @@
+name: 报告问题
+description: 使用中遇到异常、报错，或行为不符合预期
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！有一件事能省掉一大半来回：**先把 `--check` 的输出贴上**。
+
+        ```bash
+        KakaCat.exe --check          # 源码运行：python main.py --check
+        ```
+
+        它会打印外部工具（mpv / ffplay / ffmpeg）的检测结果、程序目录与运行数据目录。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 你做了什么、期望发生什么、实际发生了什么
+      placeholder: |
+        我点了「在线播放」，但播放器窗口没有出现。
+        期望：ffplay 或 mpv 窗口弹出并开始播放。
+    validations:
+      required: true
+
+  - type: textarea
+    id: check-output
+    attributes:
+      label: "--check 的输出"
+      description: 整段粘进来即可（它不含任何密钥或完整地址）
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 与哪部分有关
+      options:
+        - 下载
+        - 在线播放
+        - 界面 / 交互
+        - 打包后的安装包
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 界面标题栏或「关于」里看不到的话，就填安装包文件名，例如 KakaCat-2.0.0-setup.exe
+      placeholder: "2.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: 运行方式
+      options:
+        - 安装包装出来的
+        - 免安装的绿色版目录
+        - 从源码运行（python main.py）
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: "Windows 11 23H2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 运行日志
+      description: 界面底部日志区里相关的几行（**确认过不含密钥和完整地址**再贴）
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我贴出的内容里不含授权密钥、完整签名地址或 Cookie
+          required: true

@@ -69,6 +69,10 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 [Files]
 ; 整个打包目录原样装过去（含 bin\ 下的 ffmpeg / mpv，如果有的话）
 Source: "..\dist\KakaCat\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 许可材料：随包分发的 ffmpeg / mpv 是 GPL，分发时必须随附许可证全文与来源声明
+Source: "..\LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

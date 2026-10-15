@@ -1,0 +1,49 @@
+name: 功能请求
+description: 想要一个新功能，或觉得现有行为可以更好
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        重点说清楚**你想解决什么问题**，而不只是"加个按钮"——
+        这样更容易找到比原想法更合适的做法。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 现在的做法哪里让你不方便
+      placeholder: |
+        下载长视频时没法先确认内容对不对，只能下完再看，下错了要重来。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望怎么解决
+      description: 有具体想法就写，没有也行——说清问题就够了
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代办法
+      description: 例如用别的工具、手动改文件名、调整某个设置
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 与哪部分有关
+      options:
+        - 下载
+        - 在线播放
+        - 界面 / 交互
+        - 打包 / 安装
+        - 其他
+    validations:
+      required: true

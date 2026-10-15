@@ -1,5 +1,13 @@
 # KakaCat
 
+[![version](https://img.shields.io/badge/version-2.0.0-1f6feb)](https://github.com/Huangkaka114/KakaCat/releases)
+[![license](https://img.shields.io/badge/license-MIT-2FD69A)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.11%2B-3776AB)](https://www.python.org/)
+[![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)](https://github.com/Huangkaka114/KakaCat/releases)
+[![UI](https://img.shields.io/badge/UI-CustomTkinter-4CC2FF)](https://github.com/TomSchimansky/CustomTkinter)
+[![tests](https://img.shields.io/badge/tests-397%20passed-2FD69A)](tests)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-2FD69A)](CONTRIBUTING.md)
+
 一个基于 **CustomTkinter** 的现代化 HLS 视频下载器（Windows 桌面应用）：输入 M3U8
 播放列表链接，程序获取并解析播放列表、并发下载视频分片，最后合并成完整的视频文件。
 
@@ -522,3 +530,45 @@ dist\KakaCat\KakaCat.exe --check
 3. 检查程序目录：只应多出 `data\`（如果用了便携模式），不应出现分片或临时文件；
 4. 把整个程序目录拷到另一台没装 ffmpeg/mpv 的机器上，用随包的 `bin\` 再走一遍
    第 2、3 步。
+
+## 十五、许可
+
+**本项目自身的代码使用 [MIT 许可证](LICENSE)** —— 你可以自由使用、修改、分发，
+包括用于闭源商业产品，只需保留版权声明与许可证原文。
+
+但它运行和分发时会用到第三方组件，它们各有各的许可，详见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。两点最需要注意：
+
+- **Python 依赖全是宽松许可**，不要求你公开自己的代码。其中 PyInstaller 虽是
+  GPLv2，但带 bootloader 例外，用它打包出来的程序不受 GPL 传染。
+- **用 `--bundle-tools` 打出来的安装包里含有 GPL 程序**（ffmpeg 为 GPLv3、
+  mpv 为 GPLv2+）。分发这样的安装包就是在分发 GPL 程序，需要随附许可证全文并提供
+  对应源码。许可证全文已放在 [`licenses/`](licenses)，打包脚本会把它们和本声明
+  一起装进安装目录。
+
+KakaCat 通过**独立的子进程**调用 ffmpeg / mpv（命令行参数与 JSON IPC），不对它们
+做任何修改，属于聚合使用，因此 MIT 的本项目代码不会被 GPL 传染。
+
+> 上面是工程上的通行做法说明，不是法律意见。商业分发前建议让专业人士看一眼
+> "对应源码的提供方式"。
+
+## 十六、反馈与贡献
+
+**遇到问题、想要新功能，都欢迎开 Issue；想改代码就直接提 PR。** 详细约定见
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
+- [报告问题](https://github.com/Huangkaka114/KakaCat/issues/new?template=bug_report.yml)
+- [功能请求](https://github.com/Huangkaka114/KakaCat/issues/new?template=feature_request.yml)
+- [全部 Issue](https://github.com/Huangkaka114/KakaCat/issues)
+
+**提 Issue 前请先跑一次自检**，把输出贴上：
+
+```bash
+KakaCat.exe --check          # 源码运行：python main.py --check
+```
+
+它会打印 mpv / ffplay / ffmpeg 的检测结果、程序目录、运行数据目录——下载和在线播放
+相关的多数问题，看一眼这个就定位得差不多了，能省掉好几轮来回。
+
+> 贴日志或截图前，请确认里面**不含授权密钥、完整的签名地址或 Cookie**。程序日志本身
+> 已经对地址做了脱敏，但你自己贴的时候留意一下。
